@@ -1,0 +1,1715 @@
+package eorm
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// --- Global Functions (Operation on default database) ---
+
+// getDBForModel 获取模型对应的数据库实例
+// 如果模型未指定数据库名称，则使用默认数据库
+func getDBForModel(model IDbModel) (*DB, error) {
+	dbName := model.DatabaseName()
+	if dbName == "" {
+		// 使用默认数据库
+		db, err := defaultDB()
+		if err != nil {
+			return nil, fmt.Errorf("eorm: no default database set, please use db.XXX() method or set default database with eorm.Open(): %w", err)
+		}
+		return db, nil
+	}
+	// 使用指定的数据库
+	return Use(dbName), nil
+}
+
+func Query(querySQL string, args ...interface{}) ([]*Record, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return nil, err
+	}
+	return db.Query(querySQL, args...)
+}
+
+func QueryFirst(querySQL string, args ...interface{}) (*Record, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return nil, err
+	}
+	return db.QueryFirst(querySQL, args...)
+}
+
+func QueryToDbModel(dest interface{}, querySQL string, args ...interface{}) error {
+	records, err := Query(querySQL, args...)
+	if err != nil {
+		return err
+	}
+	return ToStructs(records, dest)
+}
+
+func QueryFirstToDbModel(dest interface{}, querySQL string, args ...interface{}) error {
+	record, err := QueryFirst(querySQL, args...)
+	if err != nil {
+		return err
+	}
+	if record == nil {
+		return fmt.Errorf("eorm: no record found")
+	}
+	return ToStruct(record, dest)
+}
+
+func QueryMap(querySQL string, args ...interface{}) ([]map[string]interface{}, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return nil, err
+	}
+	return db.QueryMap(querySQL, args...)
+}
+
+// QueryWithOutTrashed 执行原始 SQL 查询并自动过滤软删除数据（全局函数）
+// 实现快速路径检查（软删除功能禁用、表未配置）
+// 调用 dbManager 的分析方法，错误时回退到原始 Query 方法
+func QueryWithOutTrashed(querySQL string, args ...interface{}) ([]*Record, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return nil, err
+	}
+	return db.QueryWithOutTrashed(querySQL, args...)
+}
+
+// QueryFirstWithOutTrashed 执行原始 SQL 查询并返回第一条非软删除记录（全局函数）
+// 基于 QueryWithOutTrashed 实现，返回第一条记录，处理空结果情况
+func QueryFirstWithOutTrashed(querySQL string, args ...interface{}) (*Record, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return nil, err
+	}
+	return db.QueryFirstWithOutTrashed(querySQL, args...)
+}
+
+func Exec(querySQL string, args ...interface{}) (sql.Result, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return nil, err
+	}
+	return db.Exec(querySQL, args...)
+}
+
+// BatchExec 批量执行多个 SQL 语句（全局函数）
+// sqls: SQL 语句列表
+// args: 每个 SQL 语句对应的参数列表（可选，传 nil 或不传表示所有语句都不带参数）
+// 返回: 每个语句的执行结果列表和错误（如果有失败的语句，err 不为 nil）
+func BatchExec(sqls []string, args ...[]interface{}) ([]StatementResult, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return nil, err
+	}
+	return db.BatchExec(sqls, args...)
+}
+
+func SaveRecord(table string, record *Record) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.SaveRecord(table, record)
+}
+
+func UpdateRecord(table string, record *Record) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.UpdateRecord(table, record)
+}
+
+func InsertRecord(table string, record *Record) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.InsertRecord(table, record)
+}
+
+func Update(table string, record *Record, whereSql string, whereArgs ...interface{}) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	// 如果特性检查都关闭，直接使用快速路径
+	if !db.dbMgr.enableTimestampCheck && !db.dbMgr.enableOptimisticLockCheck {
+		return db.dbMgr.updateRecordFast(sdb, table, record, whereSql, whereArgs...)
+	}
+	return db.dbMgr.update(sdb, table, record, whereSql, whereArgs...)
+}
+
+// UpdateFast is a lightweight update that always skips timestamp and optimistic lock checks.
+// Use this when you need maximum performance and don't need these features.
+func UpdateFast(table string, record *Record, whereSql string, whereArgs ...interface{}) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.dbMgr.updateRecordFast(sdb, table, record, whereSql, whereArgs...)
+}
+
+func Delete(table string, whereSql string, whereArgs ...interface{}) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.Delete(table, whereSql, whereArgs...)
+}
+
+func DeleteRecord(table string, record *Record) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.DeleteRecord(table, record)
+}
+
+func BatchInsertRecord(table string, records []*Record, batchSize ...int) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.BatchInsertRecord(table, records, batchSize...)
+}
+
+// BatchUpdateRecord updates multiple records by primary key
+func BatchUpdateRecord(table string, records []*Record, batchSize ...int) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.BatchUpdateRecord(table, records, batchSize...)
+}
+
+// BatchDeleteRecord deletes multiple records by primary key
+func BatchDeleteRecord(table string, records []*Record, batchSize ...int) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.BatchDeleteRecord(table, records, batchSize...)
+}
+
+// BatchDeleteByIds deletes records by primary key IDs
+func BatchDeleteByIds(table string, ids []interface{}, batchSize ...int) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.BatchDeleteByIds(table, ids, batchSize...)
+}
+
+func Count(table string, whereSql string, whereArgs ...interface{}) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.Count(table, whereSql, whereArgs...)
+}
+
+func Exists(table string, whereSql string, whereArgs ...interface{}) (bool, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return false, err
+	}
+	return db.Exists(table, whereSql, whereArgs...)
+
+}
+
+func PaginateBuilder(page int, pageSize int, selectSql string, table string, whereSql string, orderBySql string, args ...interface{}) (*Page[*Record], error) {
+	db, err := defaultDB()
+	if err != nil {
+		return nil, err
+	}
+	return db.PaginateBuilder(page, pageSize, selectSql, table, whereSql, orderBySql, args...)
+}
+
+// Paginate 全局分页函数，使用完整SQL语句进行分页查询
+// 自动解析SQL并根据数据库类型生成相应的分页语句
+func Paginate(page int, pageSize int, querySQL string, args ...interface{}) (*Page[*Record], error) {
+	db, err := defaultDB()
+	if err != nil {
+		return nil, err
+	}
+	return db.Paginate(page, pageSize, querySQL, args...)
+}
+
+func Transaction(fn func(*Tx) error) error {
+	db, err := defaultDB()
+	if err != nil {
+		return err
+	}
+	return db.Transaction(fn)
+}
+
+func Ping() error {
+	dbMgr, err := safeGetCurrentDB()
+	if err != nil {
+		return err
+	}
+	return dbMgr.Ping()
+}
+
+// Timeout returns a DB instance with the specified query timeout
+func Timeout(d time.Duration) *DB {
+	db, err := defaultDB()
+	if err != nil {
+		return &DB{lastErr: err}
+	}
+	db.timeout = d
+	return db
+}
+
+// WithCountCache 全局计数缓存函数，返回配置好的DB实例
+// 用于在分页查询时缓存 COUNT 查询结果，避免重复执行 COUNT 语句
+// ttl: 缓存时间，如果为 0 则不缓存，如果大于 0 则缓存指定时间
+// 注意：使用此函数前需要先通过 Cache() 函数设置缓存存储库
+// 示例: eorm.Cache("user_cache").WithCountCache(5*time.Minute).Paginate(1, 10, sql, args...)
+//
+//	或者: db := eorm.Cache("user_cache"); db.WithCountCache(5*time.Minute).Paginate(...)
+func WithCountCache(ttl time.Duration) *DB {
+	db, err := defaultDB()
+	if err != nil {
+		return &DB{lastErr: err}
+	}
+	return db.WithCountCache(ttl)
+}
+
+// PingDB pings a specific database by name
+func PingDB(dbname string) error {
+	dbMgr := GetDatabase(dbname)
+	if dbMgr == nil {
+		return fmt.Errorf("eorm: database '%s' not found", dbname)
+	}
+	return dbMgr.Ping()
+}
+
+// GetTableColumns 获取指定表的所有列信息（全局函数）
+// 返回列名、字段类型、是否可空、是否主键、备注信息等
+func GetTableColumns(table string) ([]ColumnInfo, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return nil, err
+	}
+	return db.GetTableColumns(table)
+}
+
+// GetAllTables 获取数据库中所有表名（全局函数）
+// 根据不同的数据库类型使用相应的查询语句
+func GetAllTables() ([]string, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return nil, err
+	}
+	return db.GetAllTables()
+}
+
+func BeginTransaction() (*Tx, error) {
+	dbMgr, err := safeGetCurrentDB()
+	if err != nil {
+		return nil, err
+	}
+	sdb, err := dbMgr.getDB()
+	if err != nil {
+		return nil, err
+	}
+	tx, err := sdb.Begin()
+	if err != nil {
+		return nil, err
+	}
+	return &Tx{tx: tx, dbMgr: dbMgr}, nil
+}
+
+func ExecTx(tx *Tx, querySQL string, args ...interface{}) (sql.Result, error) {
+	return tx.dbMgr.exec(tx.tx, querySQL, args...)
+}
+
+func SaveTx(tx *Tx, table string, record *Record) (int64, error) {
+	return tx.SaveRecord(table, record)
+}
+
+func UpdateTx(tx *Tx, table string, record *Record, whereSql string, whereArgs ...interface{}) (int64, error) {
+	return tx.Update(table, record, whereSql, whereArgs...)
+}
+
+func WithTransaction(fn func(*Tx) error) error {
+	return Transaction(fn)
+}
+
+func FindAll(table string) ([]*Record, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return nil, err
+	}
+	return db.FindAll(table)
+}
+
+// --- Struct Methods (Operation on models implementing IDbModel) ---
+
+func SaveDbModel(model IDbModel) (int64, error) {
+	db, err := getDBForModel(model)
+	if err != nil {
+		return 0, err
+	}
+	return db.SaveDbModel(model)
+}
+
+func InsertDbModel(model IDbModel) (int64, error) {
+	db, err := getDBForModel(model)
+	if err != nil {
+		return 0, err
+	}
+	return db.InsertDbModel(model)
+}
+
+func UpdateDbModel(model IDbModel) (int64, error) {
+	db, err := getDBForModel(model)
+	if err != nil {
+		return 0, err
+	}
+	return db.UpdateDbModel(model)
+}
+
+func DeleteDbModel(model IDbModel) (int64, error) {
+	db, err := getDBForModel(model)
+	if err != nil {
+		return 0, err
+	}
+	return db.DeleteDbModel(model)
+}
+
+func FindFirstToDbModel(model IDbModel, whereSql string, whereArgs ...interface{}) error {
+	db, err := getDBForModel(model)
+	if err != nil {
+		return err
+	}
+	return db.FindFirstToDbModel(model, whereSql, whereArgs...)
+}
+
+func FindToDbModel(dest interface{}, table string, whereSql string, orderBySql string, whereArgs ...interface{}) error {
+	db, err := defaultDB()
+	if err != nil {
+		return err
+	}
+	return db.FindToDbModel(dest, table, whereSql, orderBySql, whereArgs...)
+}
+
+// --- DB Methods (Operation on specific database instance) ---
+
+// Cache 使用默认缓存（可通过 SetDefaultCache 切换默认缓存）
+func (db *DB) Cache(cacheRepositoryName string, ttl ...time.Duration) *DB {
+	db.cacheRepositoryName = cacheRepositoryName
+	db.cacheProvider = nil // 使用默认缓存
+	if len(ttl) > 0 {
+		db.cacheTTL = ttl[0]
+	} else {
+		db.cacheTTL = -1
+	}
+	return db
+}
+
+// LocalCache 使用本地缓存
+func (db *DB) LocalCache(cacheRepositoryName string, ttl ...time.Duration) *DB {
+	db.cacheRepositoryName = cacheRepositoryName
+	db.cacheProvider = GetLocalCacheInstance()
+	if len(ttl) > 0 {
+		db.cacheTTL = ttl[0]
+	} else {
+		db.cacheTTL = -1
+	}
+	return db
+}
+
+// RedisCache 使用 Redis 缓存
+func (db *DB) RedisCache(cacheRepositoryName string, ttl ...time.Duration) *DB {
+	redisCache := GetRedisCacheInstance()
+	if redisCache == nil {
+		// 如果 Redis 缓存未初始化，记录错误但不中断链式调用
+		LogError("Redis cache not initialized for DB", map[string]interface{}{
+			"cacheRepositoryName": cacheRepositoryName,
+		})
+		return db
+	}
+
+	db.cacheRepositoryName = cacheRepositoryName
+	db.cacheProvider = redisCache
+	if len(ttl) > 0 {
+		db.cacheTTL = ttl[0]
+	} else {
+		db.cacheTTL = -1
+	}
+	return db
+}
+
+// Timeout sets the query timeout for this DB instance
+func (db *DB) Timeout(d time.Duration) *DB {
+	db.timeout = d
+	return db
+}
+
+// WithCountCache 启用分页计数缓存
+// 用于在分页查询时缓存 COUNT 查询结果，避免重复执行 COUNT 语句
+// ttl: 缓存时间，如果为 0 则不缓存，如果大于 0 则缓存指定时间
+// 示例: eorm.Cache("user_cache").WithCountCache(5*time.Minute).Paginate(1, 10, sql, args...)
+func (db *DB) WithCountCache(ttl time.Duration) *DB {
+	db.countCacheTTL = ttl
+	return db
+}
+
+func (db *DB) Query(querySQL string, args ...interface{}) ([]*Record, error) {
+	if db.lastErr != nil {
+		return nil, db.lastErr
+	}
+	ctx, cancel := db.getContext()
+	defer cancel()
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return nil, err
+	}
+	if db.cacheRepositoryName != "" {
+		cache := db.getEffectiveCache()
+		key := GenerateCacheKey(db.dbMgr.name, querySQL, args...)
+		if val, ok := cache.CacheGet(db.cacheRepositoryName, key); ok {
+			var results []*Record
+			if convertCacheValue(val, &results) {
+				return results, nil
+			}
+		}
+
+		results, err := db.dbMgr.queryWithContext(ctx, sdb, querySQL, args...)
+		if err == nil {
+			cache.CacheSet(db.cacheRepositoryName, key, results, getEffectiveTTL(db.cacheRepositoryName, db.cacheTTL))
+		}
+		return results, err
+	}
+	return db.dbMgr.queryWithContext(ctx, sdb, querySQL, args...)
+}
+
+func (db *DB) QueryFirst(querySQL string, args ...interface{}) (*Record, error) {
+	if db.lastErr != nil {
+		return nil, db.lastErr
+	}
+	ctx, cancel := db.getContext()
+	defer cancel()
+
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return nil, err
+	}
+	if db.cacheRepositoryName != "" {
+		cache := db.getEffectiveCache()
+		key := GenerateCacheKey(db.dbMgr.name, querySQL, args...)
+		if val, ok := cache.CacheGet(db.cacheRepositoryName, key); ok {
+			var result *Record
+			if convertCacheValue(val, &result) {
+				return result, nil
+			}
+		}
+		result, err := db.dbMgr.queryFirstWithContext(ctx, sdb, querySQL, args...)
+		if err == nil && result != nil {
+			cache.CacheSet(db.cacheRepositoryName, key, result, getEffectiveTTL(db.cacheRepositoryName, db.cacheTTL))
+		}
+		return result, err
+	}
+	return db.dbMgr.queryFirstWithContext(ctx, sdb, querySQL, args...)
+}
+
+func (db *DB) QueryToDbModel(dest interface{}, querySQL string, args ...interface{}) error {
+	records, err := db.Query(querySQL, args...)
+	if err != nil {
+		return err
+	}
+	return ToStructs(records, dest)
+}
+
+func (db *DB) QueryFirstToDbModel(dest interface{}, querySQL string, args ...interface{}) error {
+	record, err := db.QueryFirst(querySQL, args...)
+	if err != nil {
+		return err
+	}
+	if record == nil {
+		return fmt.Errorf("eorm: no record found")
+	}
+	return ToStruct(record, dest)
+}
+
+func (db *DB) QueryMap(querySQL string, args ...interface{}) ([]map[string]interface{}, error) {
+	if db.lastErr != nil {
+		return nil, db.lastErr
+	}
+	ctx, cancel := db.getContext()
+	defer cancel()
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return nil, err
+	}
+	if db.cacheRepositoryName != "" {
+		cache := db.getEffectiveCache()
+		key := GenerateCacheKey(db.dbMgr.name, querySQL, args...)
+		if val, ok := cache.CacheGet(db.cacheRepositoryName, key); ok {
+			var results []map[string]interface{}
+			if convertCacheValue(val, &results) {
+				return results, nil
+			}
+		}
+		results, err := db.dbMgr.queryMapWithContext(ctx, sdb, querySQL, args...)
+		if err == nil {
+			cache.CacheSet(db.cacheRepositoryName, key, results, getEffectiveTTL(db.cacheRepositoryName, db.cacheTTL))
+		}
+		return results, err
+	}
+	return db.dbMgr.queryMapWithContext(ctx, sdb, querySQL, args...)
+}
+
+// QueryWithOutTrashed 执行原始 SQL 查询并自动过滤软删除数据
+// 支持缓存功能集成和超时设置传递
+func (db *DB) QueryWithOutTrashed(querySQL string, args ...interface{}) ([]*Record, error) {
+	if db.lastErr != nil {
+		return nil, db.lastErr
+	}
+
+	// 1. 快速路径检查：软删除功能禁用时直接调用原始 Query 方法
+	if !db.dbMgr.enableSoftDeleteCheck {
+		return db.Query(querySQL, args...)
+	}
+
+	// 2. SQL分析：检查是否需要注入软删除条件
+	analysisResult, err := db.dbMgr.analyzeSQLForSoftDelete(querySQL)
+	if err != nil {
+		// 分析失败时回退到原始 Query 方法
+		return db.Query(querySQL, args...)
+	}
+
+	// 3. 判断是否需要处理：表未配置或已有条件时直接调用原始方法
+	if !analysisResult.needsInjection {
+		return db.Query(querySQL, args...)
+	}
+
+	// 4. 执行修改后的SQL
+	return db.Query(analysisResult.modifiedSQL, args...)
+}
+
+// QueryFirstWithOutTrashed 执行原始 SQL 查询并返回第一条非软删除记录
+// 基于 QueryWithOutTrashed 实现，支持缓存和超时功能
+func (db *DB) QueryFirstWithOutTrashed(querySQL string, args ...interface{}) (*Record, error) {
+	if db.lastErr != nil {
+		return nil, db.lastErr
+	}
+
+	// 基于 QueryWithOutTrashed 实现
+	records, err := db.QueryWithOutTrashed(querySQL, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	// 处理空结果情况
+	if len(records) == 0 {
+		return nil, nil
+	}
+
+	// 返回第一条记录
+	return records[0], nil
+}
+
+func (db *DB) Exec(querySQL string, args ...interface{}) (sql.Result, error) {
+	if db.lastErr != nil {
+		return nil, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := db.getContext()
+	defer cancel()
+	res, err := db.dbMgr.execWithContext(ctx, sdb, querySQL, args...)
+	if err == nil && db.cacheRepositoryName != "" {
+		db.ClearCache(db.cacheRepositoryName)
+	}
+	return res, err
+}
+
+// BatchExec 批量执行多个 SQL 语句（DB 方法）
+// sqls: SQL 语句列表
+// args: 每个 SQL 语句对应的参数列表（可选，传 nil 或不传表示所有语句都不带参数）
+// 返回: 每个语句的执行结果列表和错误（如果有失败的语句，err 不为 nil）
+func (db *DB) BatchExec(sqls []string, args ...[]interface{}) ([]StatementResult, error) {
+	if db.lastErr != nil {
+		return nil, db.lastErr
+	}
+
+	// 获取数据库连接
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return nil, err
+	}
+
+	// 获取超时上下文
+	ctx, cancel := db.getContext()
+	defer cancel()
+
+	// 处理可变参数
+	var actualArgs [][]interface{}
+	if len(args) > 0 {
+		actualArgs = args
+	}
+
+	// 调用 dbMgr.batchExecWithContext
+	return db.dbMgr.batchExecWithContext(ctx, sdb, sqls, actualArgs)
+}
+
+func (db *DB) SaveRecord(table string, record *Record) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	id, err := db.dbMgr.saveRecord(sdb, table, record)
+	if err == nil && db.cacheRepositoryName != "" {
+		db.ClearCache(db.cacheRepositoryName)
+	}
+	return id, err
+}
+
+func (db *DB) InsertRecord(table string, record *Record) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.dbMgr.insertRecord(sdb, table, record)
+}
+
+func (db *DB) insertWithOptions(table string, record *Record, skipTimestamps bool) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.dbMgr.insertRecordWithOptions(sdb, table, record, skipTimestamps)
+}
+
+func (db *DB) Update(table string, record *Record, whereSql string, whereArgs ...interface{}) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+
+	var rows int64
+	// If both feature checks are disabled, use fast path directly
+	if !db.dbMgr.enableTimestampCheck && !db.dbMgr.enableOptimisticLockCheck {
+		rows, err = db.dbMgr.updateRecordFast(sdb, table, record, whereSql, whereArgs...)
+	} else {
+		rows, err = db.dbMgr.update(sdb, table, record, whereSql, whereArgs...)
+	}
+
+	if err == nil && db.cacheRepositoryName != "" {
+		db.ClearCache(db.cacheRepositoryName)
+	}
+	return rows, err
+}
+
+// UpdateFast is a lightweight update that always skips timestamp and optimistic lock checks.
+func (db *DB) UpdateFast(table string, record *Record, whereSql string, whereArgs ...interface{}) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.dbMgr.updateRecordFast(sdb, table, record, whereSql, whereArgs...)
+}
+
+func (db *DB) updateWithOptions(table string, record *Record, whereSql string, skipTimestamps bool, whereArgs ...interface{}) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.dbMgr.updateRecordWithOptions(sdb, table, record, whereSql, skipTimestamps, whereArgs...)
+}
+
+func (db *DB) UpdateRecord(table string, record *Record) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.dbMgr.updateRecord(sdb, table, record)
+}
+
+func (db *DB) Delete(table string, whereSql string, whereArgs ...interface{}) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	rows, err := db.dbMgr.delete(sdb, table, whereSql, whereArgs...)
+	if err == nil && db.cacheRepositoryName != "" {
+		db.ClearCache(db.cacheRepositoryName)
+	}
+	return rows, err
+}
+
+func (db *DB) DeleteRecord(table string, record *Record) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.dbMgr.deleteRecord(sdb, table, record)
+}
+
+func (db *DB) BatchInsertRecord(table string, records []*Record, batchSize ...int) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	// 使用可选参数，如果未提供则使用默认值
+	size := DefaultBatchSize
+	if len(batchSize) > 0 && batchSize[0] > 0 {
+		size = batchSize[0]
+	}
+	return db.dbMgr.batchInsertRecord(sdb, table, records, size)
+}
+
+// BatchUpdateRecord updates multiple records by primary key
+func (db *DB) BatchUpdateRecord(table string, records []*Record, batchSize ...int) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	// 使用可选参数，如果未提供则使用默认值
+	size := DefaultBatchSize
+	if len(batchSize) > 0 && batchSize[0] > 0 {
+		size = batchSize[0]
+	}
+	return db.dbMgr.batchUpdateRecord(sdb, table, records, size)
+}
+
+// BatchDeleteRecord deletes multiple records by primary key
+func (db *DB) BatchDeleteRecord(table string, records []*Record, batchSize ...int) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	// 使用可选参数，如果未提供则使用默认值
+	size := DefaultBatchSize
+	if len(batchSize) > 0 && batchSize[0] > 0 {
+		size = batchSize[0]
+	}
+	return db.dbMgr.batchDeleteRecord(sdb, table, records, size)
+}
+
+// BatchDeleteByIds deletes records by primary key IDs
+func (db *DB) BatchDeleteByIds(table string, ids []interface{}, batchSize ...int) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	// 使用可选参数，如果未提供则使用默认值
+	size := DefaultBatchSize
+	if len(batchSize) > 0 && batchSize[0] > 0 {
+		size = batchSize[0]
+	}
+	return db.dbMgr.batchDeleteByIds(sdb, table, ids, size)
+}
+
+func (db *DB) Count(table string, whereSql string, whereArgs ...interface{}) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	if db.cacheRepositoryName != "" {
+		cache := db.getEffectiveCache()
+		key := GenerateCacheKey(db.dbMgr.name, "COUNT:"+table+":"+whereSql, whereArgs...)
+		if val, ok := cache.CacheGet(db.cacheRepositoryName, key); ok {
+			var count int64
+			if convertCacheValue(val, &count) {
+				return count, nil
+			}
+		}
+		count, err := db.dbMgr.count(sdb, table, whereSql, whereArgs...)
+		if err == nil {
+			cache.CacheSet(db.cacheRepositoryName, key, count, getEffectiveTTL(db.cacheRepositoryName, db.cacheTTL))
+		}
+		return count, err
+	}
+	return db.dbMgr.count(sdb, table, whereSql, whereArgs...)
+}
+
+func (db *DB) Ping() error {
+	if db.lastErr != nil {
+		return db.lastErr
+	}
+	return db.dbMgr.Ping()
+}
+
+func (db *DB) Exists(table string, whereSql string, whereArgs ...interface{}) (bool, error) {
+	if db.lastErr != nil {
+		return false, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return false, err
+	}
+	return db.dbMgr.exists(sdb, table, whereSql, whereArgs...)
+}
+
+func (db *DB) PaginateBuilder(page int, pageSize int, selectSql string, table string, whereSql string, orderBySql string, args ...interface{}) (*Page[*Record], error) {
+	if db.lastErr != nil {
+		return nil, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return nil, err
+	}
+	if table != "" {
+		if err := ValidateTableName(table); err != nil {
+			return nil, err
+		}
+	}
+	querySQL := selectSql
+	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(selectSql)), "SELECT ") {
+		querySQL = "SELECT " + selectSql
+	}
+
+	if !strings.Contains(strings.ToUpper(querySQL), " FROM") && table != "" {
+		querySQL += " FROM " + table
+	}
+	if whereSql != "" {
+		querySQL += " WHERE " + whereSql
+	}
+	if orderBySql != "" {
+		querySQL += " ORDER BY " + orderBySql
+	}
+
+	if db.cacheRepositoryName != "" {
+		cache := db.getEffectiveCache()
+		// 缓存键包含 page 和 pageSize，确保不同页码使用不同的缓存
+		key := GenerateCacheKey(db.dbMgr.name, fmt.Sprintf("PAGINATE:p%d_s%d:%s", page, pageSize, querySQL), args...)
+		if val, ok := cache.CacheGet(db.cacheRepositoryName, key); ok {
+			var pageObj *Page[*Record]
+			if convertCacheValue(val, &pageObj) {
+				return pageObj, nil
+			}
+		}
+		list, totalRow, err := db.dbMgr.paginate(sdb, querySQL, page, pageSize, db.countCacheTTL, args...)
+		if err == nil {
+			pageObj := NewPage(list, page, pageSize, totalRow)
+			cache.CacheSet(db.cacheRepositoryName, key, pageObj, getEffectiveTTL(db.cacheRepositoryName, db.cacheTTL))
+			return pageObj, nil
+		}
+		return nil, err
+	}
+
+	list, totalRow, err := db.dbMgr.paginate(sdb, querySQL, page, pageSize, db.countCacheTTL, args...)
+	if err != nil {
+		return nil, err
+	}
+	return NewPage(list, page, pageSize, totalRow), nil
+}
+
+// Paginate DB实例分页方法，使用完整SQL语句进行分页查询
+// 自动解析SQL并根据数据库类型生成相应的分页语句，支持缓存集成
+func (db *DB) Paginate(page int, pageSize int, querySQL string, args ...interface{}) (*Page[*Record], error) {
+	if db.lastErr != nil {
+		return nil, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return nil, err
+	}
+	if db.cacheRepositoryName != "" {
+		cache := db.getEffectiveCache()
+		// 缓存键包含 page 和 pageSize，确保不同页码使用不同的缓存
+		key := GenerateCacheKey(db.dbMgr.name, fmt.Sprintf("PAGINATE_SQL:p%d_s%d:%s", page, pageSize, querySQL), args...)
+		if val, ok := cache.CacheGet(db.cacheRepositoryName, key); ok {
+			var pageObj *Page[*Record]
+			if convertCacheValue(val, &pageObj) {
+				return pageObj, nil
+			}
+		}
+		list, totalRow, err := db.dbMgr.paginate(sdb, querySQL, page, pageSize, db.countCacheTTL, args...)
+		if err == nil {
+			pageObj := NewPage(list, page, pageSize, totalRow)
+			cache.CacheSet(db.cacheRepositoryName, key, pageObj, getEffectiveTTL(db.cacheRepositoryName, db.cacheTTL))
+			return pageObj, nil
+		}
+		return nil, err
+	}
+
+	list, totalRow, err := db.dbMgr.paginate(sdb, querySQL, page, pageSize, db.countCacheTTL, args...)
+	if err != nil {
+		return nil, err
+	}
+	return NewPage(list, page, pageSize, totalRow), nil
+}
+
+func (db *DB) FindAll(table string) ([]*Record, error) {
+	if db.lastErr != nil {
+		return nil, db.lastErr
+	}
+	if err := ValidateTableName(table); err != nil {
+		return nil, err
+	}
+	return db.Query(fmt.Sprintf("SELECT * FROM %s", table))
+}
+
+// Struct methods for DB
+func (db *DB) SaveDbModel(model IDbModel) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	record := ToRecord(model)
+	// For Save, we also want to handle auto-increment PKs if they are 0
+	pks, _ := db.dbMgr.getPrimaryKeys(sdb, model.TableName())
+	for _, pk := range pks {
+		if val, ok := record.Get(pk).(int64); ok && val == 0 {
+			record.Remove(pk)
+		}
+	}
+	return db.SaveRecord(model.TableName(), record)
+}
+
+func (db *DB) InsertDbModel(model IDbModel) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	record := ToRecord(model)
+	// Remove primary key if it's 0 to let DB auto-increment
+	pks, _ := db.dbMgr.getPrimaryKeys(sdb, model.TableName())
+	for _, pk := range pks {
+		if val, ok := record.Get(pk).(int64); ok && val == 0 {
+			record.Remove(pk)
+		}
+	}
+	return db.InsertRecord(model.TableName(), record)
+}
+
+func (db *DB) UpdateDbModel(model IDbModel) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	record := ToRecord(model)
+	return db.UpdateRecord(model.TableName(), record)
+}
+
+func (db *DB) DeleteDbModel(model IDbModel) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	record := ToRecord(model)
+	return db.DeleteRecord(model.TableName(), record)
+}
+
+func (db *DB) FindFirstToDbModel(model IDbModel, whereSql string, whereArgs ...interface{}) error {
+	if db.lastErr != nil {
+		return db.lastErr
+	}
+	builder := db.Table(model.TableName())
+	if whereSql != "" {
+		builder.Where(whereSql, whereArgs...)
+	}
+	return builder.FindFirstToDbModel(model)
+}
+
+func (db *DB) FindToDbModel(dest interface{}, table string, whereSql string, orderBySql string, whereArgs ...interface{}) error {
+	if db.lastErr != nil {
+		return db.lastErr
+	}
+	builder := db.Table(table)
+	if whereSql != "" {
+		builder.Where(whereSql, whereArgs...)
+	}
+	if orderBySql != "" {
+		builder.OrderBy(orderBySql)
+	}
+	return builder.FindToDbModel(dest)
+}
+
+// Transaction executes a function within a transaction
+func (db *DB) Transaction(fn func(*Tx) error) (err error) {
+	if db.lastErr != nil {
+		return db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return err
+	}
+	tx, err := sdb.Begin()
+	if err != nil {
+		return err
+	}
+
+	dbtx := &Tx{tx: tx, dbMgr: db.dbMgr}
+
+	defer func() {
+		if p := recover(); p != nil {
+			// 发生 Panic 时强制回滚
+			if rbErr := tx.Rollback(); rbErr != nil {
+				LogError("transaction rollback failed on panic", map[string]interface{}{
+					"rollback_error": rbErr.Error(),
+					"panic":          p,
+				})
+			}
+			// 重新抛出 Panic 以保留堆栈信息，防止静默失败
+			panic(p)
+		}
+	}()
+
+	if err = fn(dbtx); err != nil {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			LogError("transaction rollback failed", map[string]interface{}{
+				"original_error": err.Error(),
+				"rollback_error": rbErr.Error(),
+			})
+		}
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// --- Tx Methods (Operation within a transaction) ---
+
+// Cache 使用默认缓存创建事务查询（可通过 SetDefaultCache 切换默认缓存）
+func (tx *Tx) Cache(name string, ttl ...time.Duration) *Tx {
+	tx.cacheRepositoryName = name
+	tx.cacheProvider = nil // 使用默认缓存
+	if len(ttl) > 0 {
+		tx.cacheTTL = ttl[0]
+	} else {
+		tx.cacheTTL = -1
+	}
+	return tx
+}
+
+// LocalCache 创建一个使用本地缓存的事务查询
+func (tx *Tx) LocalCache(cacheRepositoryName string, ttl ...time.Duration) *Tx {
+	tx.cacheRepositoryName = cacheRepositoryName
+	tx.cacheProvider = GetLocalCacheInstance()
+	if len(ttl) > 0 {
+		tx.cacheTTL = ttl[0]
+	} else {
+		tx.cacheTTL = -1
+	}
+	return tx
+}
+
+// RedisCache 创建一个使用 Redis 缓存的事务查询
+func (tx *Tx) RedisCache(cacheRepositoryName string, ttl ...time.Duration) *Tx {
+	redisCache := GetRedisCacheInstance()
+	if redisCache == nil {
+		// 如果 Redis 缓存未初始化，记录错误但不中断链式调用
+		LogError("Redis cache not initialized for transaction", map[string]interface{}{
+			"cacheRepositoryName": cacheRepositoryName,
+		})
+		return tx
+	}
+
+	tx.cacheRepositoryName = cacheRepositoryName
+	tx.cacheProvider = redisCache
+	if len(ttl) > 0 {
+		tx.cacheTTL = ttl[0]
+	} else {
+		tx.cacheTTL = -1
+	}
+	return tx
+}
+
+// Timeout sets the query timeout for this transaction
+func (tx *Tx) Timeout(d time.Duration) *Tx {
+	tx.timeout = d
+	return tx
+}
+
+// WithCountCache 启用分页计数缓存
+// 用于在分页查询时缓存 COUNT 查询结果，避免重复执行 COUNT 语句
+// ttl: 缓存时间，如果为 0 则不缓存，如果大于 0 则缓存指定时间
+// 示例: tx.Cache("user_cache").WithCountCache(5*time.Minute).Paginate(1, 10, sql, args...)
+func (tx *Tx) WithCountCache(ttl time.Duration) *Tx {
+	tx.countCacheTTL = ttl
+	return tx
+}
+
+// getTimeout returns the effective timeout for this Tx instance
+func (tx *Tx) getTimeout() time.Duration {
+	if tx.timeout > 0 {
+		return tx.timeout
+	}
+	if tx.dbMgr != nil && tx.dbMgr.config != nil && tx.dbMgr.config.QueryTimeout > 0 {
+		return tx.dbMgr.config.QueryTimeout
+	}
+	return 0
+}
+
+// getContext returns a context with timeout if configured
+func (tx *Tx) getContext() (context.Context, context.CancelFunc) {
+	timeout := tx.getTimeout()
+	if timeout > 0 {
+		return context.WithTimeout(context.Background(), timeout)
+	}
+	return context.Background(), func() {}
+}
+
+func (tx *Tx) Query(querySQL string, args ...interface{}) ([]*Record, error) {
+	ctx, cancel := tx.getContext()
+	defer cancel()
+
+	if tx.cacheRepositoryName != "" {
+		cache := tx.getEffectiveCache()
+		key := GenerateCacheKey(tx.dbMgr.name, querySQL, args...)
+		if val, ok := cache.CacheGet(tx.cacheRepositoryName, key); ok {
+			var results []*Record
+			if convertCacheValue(val, &results) {
+				return results, nil
+			}
+		}
+		results, err := tx.dbMgr.queryWithContext(ctx, tx.tx, querySQL, args...)
+		if err == nil {
+			cache.CacheSet(tx.cacheRepositoryName, key, results, getEffectiveTTL(tx.cacheRepositoryName, tx.cacheTTL))
+		}
+		return results, err
+	}
+	return tx.dbMgr.queryWithContext(ctx, tx.tx, querySQL, args...)
+}
+
+func (tx *Tx) QueryFirst(querySQL string, args ...interface{}) (*Record, error) {
+	ctx, cancel := tx.getContext()
+	defer cancel()
+
+	if tx.cacheRepositoryName != "" {
+		cache := tx.getEffectiveCache()
+		key := GenerateCacheKey(tx.dbMgr.name, querySQL, args...)
+		if val, ok := cache.CacheGet(tx.cacheRepositoryName, key); ok {
+			var result *Record
+			if convertCacheValue(val, &result) {
+				return result, nil
+			}
+		}
+		result, err := tx.dbMgr.queryFirstWithContext(ctx, tx.tx, querySQL, args...)
+		if err == nil && result != nil {
+			cache.CacheSet(tx.cacheRepositoryName, key, result, getEffectiveTTL(tx.cacheRepositoryName, tx.cacheTTL))
+		}
+		return result, err
+	}
+	return tx.dbMgr.queryFirstWithContext(ctx, tx.tx, querySQL, args...)
+}
+
+func (tx *Tx) QueryToDbModel(dest interface{}, querySQL string, args ...interface{}) error {
+	records, err := tx.Query(querySQL, args...)
+	if err != nil {
+		return err
+	}
+	return ToStructs(records, dest)
+}
+
+func (tx *Tx) QueryFirstToDbModel(dest interface{}, querySQL string, args ...interface{}) error {
+	record, err := tx.QueryFirst(querySQL, args...)
+	if err != nil {
+		return err
+	}
+	if record == nil {
+		return fmt.Errorf("eorm: no record found")
+	}
+	return ToStruct(record, dest)
+}
+
+func (tx *Tx) QueryMap(querySQL string, args ...interface{}) ([]map[string]interface{}, error) {
+	ctx, cancel := tx.getContext()
+	defer cancel()
+
+	if tx.cacheRepositoryName != "" {
+		cache := tx.getEffectiveCache()
+		key := GenerateCacheKey(tx.dbMgr.name, querySQL, args...)
+		if val, ok := cache.CacheGet(tx.cacheRepositoryName, key); ok {
+			var results []map[string]interface{}
+			if convertCacheValue(val, &results) {
+				return results, nil
+			}
+		}
+		results, err := tx.dbMgr.queryMapWithContext(ctx, tx.tx, querySQL, args...)
+		if err == nil {
+			cache.CacheSet(tx.cacheRepositoryName, key, results, getEffectiveTTL(tx.cacheRepositoryName, tx.cacheTTL))
+		}
+		return results, err
+	}
+	return tx.dbMgr.queryMapWithContext(ctx, tx.tx, querySQL, args...)
+}
+
+// QueryWithOutTrashed 在事务上下文中执行原始 SQL 查询并自动过滤软删除数据
+// 支持缓存和超时功能，保持事务完整性
+func (tx *Tx) QueryWithOutTrashed(querySQL string, args ...interface{}) ([]*Record, error) {
+	// 1. 快速路径检查：软删除功能禁用时直接调用原始 Query 方法
+	if !tx.dbMgr.enableSoftDeleteCheck {
+		return tx.Query(querySQL, args...)
+	}
+
+	// 2. SQL分析：检查是否需要注入软删除条件
+	analysisResult, err := tx.dbMgr.analyzeSQLForSoftDelete(querySQL)
+	if err != nil {
+		// 分析失败时回退到原始 Query 方法
+		return tx.Query(querySQL, args...)
+	}
+
+	// 3. 判断是否需要处理：表未配置或已有条件时直接调用原始方法
+	if !analysisResult.needsInjection {
+		return tx.Query(querySQL, args...)
+	}
+
+	// 4. 在事务上下文中执行修改后的SQL
+	return tx.Query(analysisResult.modifiedSQL, args...)
+}
+
+// QueryFirstWithOutTrashed 在事务上下文中执行原始 SQL 查询并返回第一条非软删除记录
+// 基于 Tx.QueryWithOutTrashed 实现，保持事务完整性
+func (tx *Tx) QueryFirstWithOutTrashed(querySQL string, args ...interface{}) (*Record, error) {
+	// 基于 QueryWithOutTrashed 实现
+	records, err := tx.QueryWithOutTrashed(querySQL, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	// 处理空结果情况
+	if len(records) == 0 {
+		return nil, nil
+	}
+
+	// 返回第一条记录
+	return records[0], nil
+}
+
+func (tx *Tx) Exec(querySQL string, args ...interface{}) (sql.Result, error) {
+	ctx, cancel := tx.getContext()
+	defer cancel()
+	res, err := tx.dbMgr.execWithContext(ctx, tx.tx, querySQL, args...)
+	if err == nil && tx.cacheRepositoryName != "" {
+		tx.ClearCache(tx.cacheRepositoryName)
+	}
+	return res, err
+}
+
+func (tx *Tx) SaveRecord(table string, record *Record) (int64, error) {
+	id, err := tx.dbMgr.saveRecord(tx.tx, table, record)
+	if err == nil && tx.cacheRepositoryName != "" {
+		tx.ClearCache(tx.cacheRepositoryName)
+	}
+	return id, err
+}
+
+func (tx *Tx) InsertRecord(table string, record *Record) (int64, error) {
+	id, err := tx.dbMgr.insertRecord(tx.tx, table, record)
+	if err == nil && tx.cacheRepositoryName != "" {
+		tx.ClearCache(tx.cacheRepositoryName)
+	}
+	return id, err
+}
+
+func (tx *Tx) insertWithOptions(table string, record *Record, skipTimestamps bool) (int64, error) {
+	return tx.dbMgr.insertRecordWithOptions(tx.tx, table, record, skipTimestamps)
+}
+
+func (tx *Tx) Update(table string, record *Record, whereSql string, whereArgs ...interface{}) (int64, error) {
+	rows, err := tx.dbMgr.update(tx.tx, table, record, whereSql, whereArgs...)
+	if err == nil && tx.cacheRepositoryName != "" {
+		tx.ClearCache(tx.cacheRepositoryName)
+	}
+	return rows, err
+}
+
+func (tx *Tx) updateWithOptions(table string, record *Record, whereSql string, skipTimestamps bool, whereArgs ...interface{}) (int64, error) {
+	return tx.dbMgr.updateRecordWithOptions(tx.tx, table, record, whereSql, skipTimestamps, whereArgs...)
+}
+
+func (tx *Tx) UpdateRecord(table string, record *Record) (int64, error) {
+	return tx.dbMgr.updateRecord(tx.tx, table, record)
+}
+
+func (tx *Tx) Delete(table string, whereSql string, whereArgs ...interface{}) (int64, error) {
+	rows, err := tx.dbMgr.delete(tx.tx, table, whereSql, whereArgs...)
+	if err == nil && tx.cacheRepositoryName != "" {
+		tx.ClearCache(tx.cacheRepositoryName)
+	}
+	return rows, err
+}
+
+func (tx *Tx) DeleteRecord(table string, record *Record) (int64, error) {
+	return tx.dbMgr.deleteRecord(tx.tx, table, record)
+}
+
+func (tx *Tx) BatchInsertRecord(table string, records []*Record, batchSize ...int) (int64, error) {
+	// 使用可选参数，如果未提供则使用默认值
+	size := DefaultBatchSize
+	if len(batchSize) > 0 && batchSize[0] > 0 {
+		size = batchSize[0]
+	}
+	return tx.dbMgr.batchInsertRecord(tx.tx, table, records, size)
+}
+
+// BatchUpdateRecord updates multiple records by primary key within transaction
+func (tx *Tx) BatchUpdateRecord(table string, records []*Record, batchSize ...int) (int64, error) {
+	// 使用可选参数，如果未提供则使用默认值
+	size := DefaultBatchSize
+	if len(batchSize) > 0 && batchSize[0] > 0 {
+		size = batchSize[0]
+	}
+	return tx.dbMgr.batchUpdateRecord(tx.tx, table, records, size)
+}
+
+// BatchDeleteRecord deletes multiple records by primary key within transaction
+func (tx *Tx) BatchDeleteRecord(table string, records []*Record, batchSize ...int) (int64, error) {
+	// 使用可选参数，如果未提供则使用默认值
+	size := DefaultBatchSize
+	if len(batchSize) > 0 && batchSize[0] > 0 {
+		size = batchSize[0]
+	}
+	return tx.dbMgr.batchDeleteRecord(tx.tx, table, records, size)
+}
+
+// BatchDeleteByIds deletes records by primary key IDs within transaction
+func (tx *Tx) BatchDeleteByIds(table string, ids []interface{}, batchSize ...int) (int64, error) {
+	// 使用可选参数，如果未提供则使用默认值
+	size := DefaultBatchSize
+	if len(batchSize) > 0 && batchSize[0] > 0 {
+		size = batchSize[0]
+	}
+	return tx.dbMgr.batchDeleteByIds(tx.tx, table, ids, size)
+}
+
+func (tx *Tx) Count(table string, whereSql string, whereArgs ...interface{}) (int64, error) {
+	if tx.cacheRepositoryName != "" {
+		cache := tx.getEffectiveCache()
+		key := GenerateCacheKey(tx.dbMgr.name, "COUNT:"+table+":"+whereSql, whereArgs...)
+		if val, ok := cache.CacheGet(tx.cacheRepositoryName, key); ok {
+			var count int64
+			if convertCacheValue(val, &count) {
+				return count, nil
+			}
+		}
+		count, err := tx.dbMgr.count(tx.tx, table, whereSql, whereArgs...)
+		if err == nil {
+			cache.CacheSet(tx.cacheRepositoryName, key, count, getEffectiveTTL(tx.cacheRepositoryName, tx.cacheTTL))
+		}
+		return count, err
+	}
+	return tx.dbMgr.count(tx.tx, table, whereSql, whereArgs...)
+}
+
+func (tx *Tx) Exists(table string, whereSql string, whereArgs ...interface{}) (bool, error) {
+	return tx.dbMgr.exists(tx.tx, table, whereSql, whereArgs...)
+}
+
+func (tx *Tx) PaginateBuilder(page int, pageSize int, selectSql string, table string, whereSql string, orderBySql string, args ...interface{}) (*Page[*Record], error) {
+	if table != "" {
+		if err := ValidateTableName(table); err != nil {
+			return nil, err
+		}
+	}
+	querySQL := selectSql
+	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(selectSql)), "SELECT ") {
+		querySQL = "SELECT " + selectSql
+	}
+
+	if !strings.Contains(strings.ToUpper(querySQL), " FROM ") && table != "" {
+		querySQL += " FROM " + table
+	}
+	if whereSql != "" {
+		querySQL += " WHERE " + whereSql
+	}
+	if orderBySql != "" {
+		querySQL += " ORDER BY " + orderBySql
+	}
+
+	if tx.cacheRepositoryName != "" {
+		cache := tx.getEffectiveCache()
+		// 缓存键包含 page 和 pageSize，确保不同页码使用不同的缓存
+		key := GenerateCacheKey(tx.dbMgr.name, fmt.Sprintf("PAGINATE:p%d_s%d:%s", page, pageSize, querySQL), args...)
+		if val, ok := cache.CacheGet(tx.cacheRepositoryName, key); ok {
+			var pageObj *Page[*Record]
+			if convertCacheValue(val, &pageObj) {
+				return pageObj, nil
+			}
+		}
+		list, totalRow, err := tx.dbMgr.paginate(tx.tx, querySQL, page, pageSize, tx.countCacheTTL, args...)
+		if err == nil {
+			pageObj := NewPage(list, page, pageSize, totalRow)
+			cache.CacheSet(tx.cacheRepositoryName, key, pageObj, getEffectiveTTL(tx.cacheRepositoryName, tx.cacheTTL))
+			return pageObj, nil
+		}
+		return nil, err
+	}
+
+	list, totalRow, err := tx.dbMgr.paginate(tx.tx, querySQL, page, pageSize, tx.countCacheTTL, args...)
+	if err != nil {
+		return nil, err
+	}
+	return NewPage(list, page, pageSize, totalRow), nil
+}
+
+// Paginate 事务分页方法，使用完整SQL语句进行分页查询
+// 在事务上下文中自动解析SQL并根据数据库类型生成相应的分页语句
+func (tx *Tx) Paginate(page int, pageSize int, querySQL string, args ...interface{}) (*Page[*Record], error) {
+	if tx.cacheRepositoryName != "" {
+		cache := tx.getEffectiveCache()
+		// 缓存键包含 page 和 pageSize，确保不同页码使用不同的缓存
+		key := GenerateCacheKey(tx.dbMgr.name, fmt.Sprintf("PAGINATE_SQL:p%d_s%d:%s", page, pageSize, querySQL), args...)
+		if val, ok := cache.CacheGet(tx.cacheRepositoryName, key); ok {
+			var pageObj *Page[*Record]
+			if convertCacheValue(val, &pageObj) {
+				return pageObj, nil
+			}
+		}
+		list, totalRow, err := tx.dbMgr.paginate(tx.tx, querySQL, page, pageSize, tx.countCacheTTL, args...)
+		if err == nil {
+			pageObj := NewPage(list, page, pageSize, totalRow)
+			cache.CacheSet(tx.cacheRepositoryName, key, pageObj, getEffectiveTTL(tx.cacheRepositoryName, tx.cacheTTL))
+			return pageObj, nil
+		}
+		return nil, err
+	}
+
+	list, totalRow, err := tx.dbMgr.paginate(tx.tx, querySQL, page, pageSize, tx.countCacheTTL, args...)
+	if err != nil {
+		return nil, err
+	}
+	return NewPage(list, page, pageSize, totalRow), nil
+}
+
+func (tx *Tx) FindAll(table string) ([]*Record, error) {
+	if err := ValidateTableName(table); err != nil {
+		return nil, err
+	}
+	return tx.Query(fmt.Sprintf("SELECT * FROM %s", table))
+}
+
+// Struct methods for Tx
+func (tx *Tx) SaveDbModel(model IDbModel) (int64, error) {
+	record := ToRecord(model)
+	return tx.SaveRecord(model.TableName(), record)
+}
+
+func (tx *Tx) InsertDbModel(model IDbModel) (int64, error) {
+	record := ToRecord(model)
+	return tx.InsertRecord(model.TableName(), record)
+}
+
+func (tx *Tx) UpdateDbModel(model IDbModel) (int64, error) {
+	record := ToRecord(model)
+	return tx.UpdateRecord(model.TableName(), record)
+}
+
+func (tx *Tx) DeleteDbModel(model IDbModel) (int64, error) {
+	record := ToRecord(model)
+	return tx.DeleteRecord(model.TableName(), record)
+}
+
+func (tx *Tx) FindFirstToDbModel(model IDbModel, whereSql string, whereArgs ...interface{}) error {
+	builder := tx.Table(model.TableName())
+	if whereSql != "" {
+		builder.Where(whereSql, whereArgs...)
+	}
+	return builder.FindFirstToDbModel(model)
+}
+
+func (tx *Tx) FindToDbModel(dest interface{}, table string, whereSql string, orderBySql string, whereArgs ...interface{}) error {
+	builder := tx.Table(table)
+	if whereSql != "" {
+		builder.Where(whereSql, whereArgs...)
+	}
+	if orderBySql != "" {
+		builder.OrderBy(orderBySql)
+	}
+	return builder.FindToDbModel(dest)
+}
+
+func (tx *Tx) Commit() error {
+	return tx.tx.Commit()
+}
+
+func (tx *Tx) Rollback() error {
+	return tx.tx.Rollback()
+}
+
+// BatchExec 批量执行多个 SQL 语句（Tx 方法）
+// sqls: SQL 语句列表
+// args: 每个 SQL 语句对应的参数列表（可选，传 nil 或不传表示所有语句都不带参数）
+// 返回: 每个语句的执行结果列表和错误（如果有失败的语句，err 不为 nil）
+func (tx *Tx) BatchExec(sqls []string, args ...[]interface{}) ([]StatementResult, error) {
+	// 获取超时上下文
+	ctx, cancel := tx.getContext()
+	defer cancel()
+
+	// 处理可变参数
+	var actualArgs [][]interface{}
+	if len(args) > 0 {
+		actualArgs = args
+	}
+
+	// 调用 dbMgr.batchExecWithContext，传入 tx.tx 作为 executor
+	return tx.dbMgr.batchExecWithContext(ctx, tx.tx, sqls, actualArgs)
+}
+
+// convertCacheValue 将缓存值转换为目标类型
+// 优先使用类型断言（零开销），失败时才使用 JSON 序列化（兼容 RedisCache）
+func convertCacheValue(val interface{}, dest interface{}) bool {
+	if val == nil {
+		return false
+	}
+
+	// 1. 优先尝试直接类型断言（LocalCache 零开销路径）
+	switch d := dest.(type) {
+	case *[]*Record:
+		// 处理 []*Record
+		if v, ok := val.([]*Record); ok {
+			// 返回副本以防止数据污染
+			newList := make([]*Record, len(v))
+			for i, r := range v {
+				newList[i] = r.Clone()
+			}
+			*d = newList
+			return true
+		}
+
+	case **Record:
+		// 处理 *Record
+		if v, ok := val.(*Record); ok {
+			// 返回副本以防止数据污染
+			*d = v.Clone()
+			return true
+		}
+
+	case *[]map[string]interface{}:
+		// 处理 []map[string]interface{}
+		if v, ok := val.([]map[string]interface{}); ok {
+			// 返回副本以防止数据污染
+			newList := make([]map[string]interface{}, len(v))
+			for i, m := range v {
+				// 对 map 进行深拷贝
+				newMap := make(map[string]interface{}, len(m))
+				for k, val := range m {
+					newMap[k] = cloneValue(val)
+				}
+				newList[i] = newMap
+			}
+			*d = newList
+			return true
+		}
+
+	case *int64:
+		// 处理 int64
+		if v, ok := val.(int64); ok {
+			*d = v
+			return true
+		}
+		// 处理其他整数类型
+		if v, ok := val.(int); ok {
+			*d = int64(v)
+			return true
+		}
+		if v, ok := val.(int32); ok {
+			*d = int64(v)
+			return true
+		}
+
+	case *int:
+		// 处理 int
+		if v, ok := val.(int); ok {
+			*d = v
+			return true
+		}
+		if v, ok := val.(int64); ok {
+			*d = int(v)
+			return true
+		}
+
+	case **Page[*Record]:
+		// 处理 *Page[*Record]
+		if v, ok := val.(*Page[*Record]); ok {
+			// 返回副本以防止数据污染
+			newList := make([]*Record, len(v.List))
+			for i, r := range v.List {
+				newList[i] = r.Clone()
+			}
+			*d = &Page[*Record]{
+				PageNumber: v.PageNumber,
+				PageSize:   v.PageSize,
+				TotalPage:  v.TotalPage,
+				TotalRow:   v.TotalRow,
+				List:       newList,
+			}
+			return true
+		}
+	}
+
+	// 2. 处理 RedisCache 返回的 JSON 字节数组（优化路径）
+	if jsonBytes, ok := val.([]byte); ok {
+		// 直接从字节数组反序列化，避免字符串转换
+		return json.Unmarshal(jsonBytes, dest) == nil
+	}
+
+	// 3. 降级到 JSON 转换（用于其他复杂类型）
+	// 注意：这是最后的手段，性能较差
+	data, err := json.Marshal(val)
+	if err != nil {
+		return false
+	}
+	return json.Unmarshal(data, dest) == nil
+}
