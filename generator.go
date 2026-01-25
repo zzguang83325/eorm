@@ -59,7 +59,9 @@ func (db *DB) GenerateDbModel(tablename, outPath, structName string) error {
 	if outPath == "" {
 		// If no path provided, generate models package in current directory
 		pkgName = "models"
-		finalPath = filepath.Join("models", strings.ToLower(tablename)+".go")
+		// finalPath = filepath.Join("models", strings.ToLower(tablename)+".go")
+		safeFileBase := strings.ReplaceAll(strings.ToLower(tablename), ".", "_")
+		finalPath = filepath.Join("models", safeFileBase+".go")
 	} else {
 		// Check if outPath is a directory or file
 		if strings.HasSuffix(outPath, ".go") {
@@ -77,14 +79,17 @@ func (db *DB) GenerateDbModel(tablename, outPath, structName string) error {
 			if pkgName == "." || pkgName == "/" {
 				pkgName = "models"
 			}
-			finalPath = filepath.Join(outPath, strings.ToLower(tablename)+".go")
+			// finalPath = filepath.Join(outPath, strings.ToLower(tablename)+".go")
+			safeFileBase := strings.ReplaceAll(strings.ToLower(tablename), ".", "_")
+			finalPath = filepath.Join(outPath, safeFileBase+".go")
 		}
 	}
 
 	// 2. Determine struct name (if structName is empty, generate from table name)
 	finalStructName := structName
 	if finalStructName == "" {
-		finalStructName = SnakeToCamel(tablename)
+		camelBase := strings.ReplaceAll(tablename, ".", "_")
+		finalStructName = SnakeToCamel(camelBase)
 	}
 
 	// 3. Build code content
@@ -325,51 +330,63 @@ func (mgr *dbManager) getTableColumns(table string) ([]ColumnInfo, error) {
 
 	case SQLite3:
 		// 使用公共查询构建函数
-		query, _ := mgr.buildColumnQuery(table)
+		query, args := mgr.buildColumnQuery(table)
 		db, err := mgr.getDB()
 		if err != nil {
 			return nil, err
 		}
-		records, err := mgr.query(db, query)
+		records, err := mgr.query(db, query, args...)
 		if err != nil {
 			return nil, err
 		}
-
-		// SQLite: 检查是否有 INTEGER PRIMARY KEY (自动自增)
-		// 需要查询 sqlite_master 获取建表语句
-		var createSQL string
-		sqlQuery := fmt.Sprintf("SELECT sql FROM sqlite_master WHERE type='table' AND name='%s'", table)
-		sqlRecords, sqlErr := mgr.query(db, sqlQuery)
-		if sqlErr == nil && len(sqlRecords) > 0 {
-			createSQL = strings.ToUpper(sqlRecords[0].GetString("sql"))
-		}
-
 		for _, r := range records {
-			colName := r.GetString("name")
-			colType := r.GetString("type")
-			isPK := r.GetInt("pk") > 0
-
-			// SQLite: INTEGER PRIMARY KEY 自动自增
-			isAutoIncr := false
-			if isPK && strings.ToUpper(colType) == "INTEGER" {
-				isAutoIncr = true
-			}
-			// 或者建表语句中明确指定了 AUTOINCREMENT
-			if createSQL != "" && strings.Contains(createSQL, strings.ToUpper(colName)) {
-				if strings.Contains(createSQL, "AUTOINCREMENT") {
-					isAutoIncr = true
-				}
-			}
+			columnKey := r.GetString("column_key")
+			extra := r.GetString("extra")
 
 			columns = append(columns, ColumnInfo{
-				Name:       colName,
-				Type:       colType,
-				Nullable:   r.GetInt("notnull") == 0,
-				IsPK:       isPK,
-				Comment:    "", // SQLite 不支持列注释
-				IsAutoIncr: isAutoIncr,
+				Name:       r.GetString("column_name"),
+				Type:       r.GetString("data_type"),
+				Nullable:   r.GetString("is_nullable") == "YES",
+				IsPK:       columnKey == "PRI",
+				Comment:    r.GetString("column_comment"),
+				IsAutoIncr: strings.Contains(strings.ToLower(extra), "auto_increment") || strings.Contains(strings.ToLower(extra), "nextval"),
 			})
 		}
+		// // SQLite: 检查是否有 INTEGER PRIMARY KEY (自动自增)
+		// // 需要查询 sqlite_master 获取建表语句
+		// var createSQL string
+		// sqlQuery := fmt.Sprintf("SELECT sql FROM sqlite_master WHERE type='table' AND name='%s'", table)
+		// sqlRecords, sqlErr := mgr.query(db, sqlQuery)
+		// if sqlErr == nil && len(sqlRecords) > 0 {
+		// 	createSQL = strings.ToUpper(sqlRecords[0].GetString("sql"))
+		// }
+
+		// for _, r := range records {
+		// 	colName := r.GetString("name")
+		// 	colType := r.GetString("type")
+		// 	isPK := r.GetInt("pk") > 0
+
+		// 	// SQLite: INTEGER PRIMARY KEY 自动自增
+		// 	isAutoIncr := false
+		// 	if isPK && strings.ToUpper(colType) == "INTEGER" {
+		// 		isAutoIncr = true
+		// 	}
+		// 	// 或者建表语句中明确指定了 AUTOINCREMENT
+		// 	if createSQL != "" && strings.Contains(createSQL, strings.ToUpper(colName)) {
+		// 		if strings.Contains(createSQL, "AUTOINCREMENT") {
+		// 			isAutoIncr = true
+		// 		}
+		// 	}
+
+		// 	columns = append(columns, ColumnInfo{
+		// 		Name:       colName,
+		// 		Type:       colType,
+		// 		Nullable:   r.GetInt("notnull") == 0,
+		// 		IsPK:       isPK,
+		// 		Comment:    "", // SQLite 不支持列注释
+		// 		IsAutoIncr: isAutoIncr,
+		// 	})
+		// }
 
 	case PostgreSQL:
 		// 使用公共查询构建函数

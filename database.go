@@ -840,6 +840,7 @@ func (mgr *dbManager) getPrimaryKeys(executor sqlExecutor, table string) ([]stri
 	// 3. 从列信息中提取主键列
 	var pks []string
 	for _, col := range columns {
+
 		if col.IsPK {
 			pks = append(pks, col.Name)
 		}
@@ -1030,6 +1031,15 @@ func (mgr *dbManager) getOrderedColumns(record *Record, table string, executor s
 		return nil, nil
 	}
 
+	// 获取表的真实列名集合（缓存）
+	tableCols, err := mgr.getTableColumns(table)
+	if err != nil {
+		return nil, nil // 或返回错误，取决于你想如何处理
+	}
+	colSet := make(map[string]bool)
+	for _, c := range tableCols {
+		colSet[strings.ToLower(c.Name)] = true
+	}
 	// 获取自增列名（利用缓存）
 	identityCol := mgr.getIdentityColumn(executor, table)
 
@@ -1037,6 +1047,12 @@ func (mgr *dbManager) getOrderedColumns(record *Record, table string, executor s
 	values := make([]interface{}, 0, len(record.columns))
 
 	for col, val := range record.columns {
+
+		// record里面,可能含有一些table里面没有的列,在这里过滤：只保留表真实存在的列（大小写不敏感）
+		if !colSet[strings.ToLower(col)] {
+			continue
+		}
+
 		// 只对 SQL Server 和 Oracle 排除自增列
 		// 这两个数据库不允许更新 IDENTITY 列
 		// MySQL/PostgreSQL/SQLite 允许更新自增列（虽然不推荐，但不会报错）
@@ -1064,7 +1080,15 @@ func (mgr *dbManager) getOrderedColumnsForInsert(record *Record, table string, e
 	if record == nil || len(record.columns) == 0 {
 		return nil, nil
 	}
-
+	// 获取表的真实列名集合（缓存）
+	tableCols, err := mgr.getTableColumns(table)
+	if err != nil {
+		return nil, nil // 或返回错误，取决于你想如何处理
+	}
+	colSet := make(map[string]bool)
+	for _, c := range tableCols {
+		colSet[strings.ToLower(c.Name)] = true
+	}
 	// 获取自增列名（利用缓存）
 	identityCol := mgr.getIdentityColumn(executor, table)
 
@@ -1072,6 +1096,12 @@ func (mgr *dbManager) getOrderedColumnsForInsert(record *Record, table string, e
 	values := make([]interface{}, 0, len(record.columns))
 
 	for col, val := range record.columns {
+
+		// record里面,可能含有一些table里面没有的列,在这里过滤：只保留表真实存在的列（大小写不敏感）
+		if !colSet[strings.ToLower(col)] {
+			continue
+		}
+
 		// 1. 排除 nil 值
 		if val == nil {
 			continue
@@ -3690,77 +3720,167 @@ func (mgr *dbManager) buildColumnQuery(table string) (string, []interface{}) {
 	switch mgr.config.Driver {
 	case MySQL:
 		// MySQL: 查询 EXTRA 字段以获取 auto_increment 信息
-		query = `SELECT 
-			COLUMN_NAME, 
-			DATA_TYPE, 
-			IS_NULLABLE, 
-			COLUMN_COMMENT, 
-			COLUMN_KEY,
-			EXTRA
-		FROM INFORMATION_SCHEMA.COLUMNS 
-		WHERE LOWER(TABLE_NAME) = LOWER(?) 
-		AND TABLE_SCHEMA = (SELECT DATABASE()) 
-		ORDER BY ORDINAL_POSITION`
-		args = []interface{}{table}
+		query = `SELECT
+  COLUMN_NAME,
+  DATA_TYPE,
+  IS_NULLABLE,
+  COLUMN_COMMENT,
+  COLUMN_KEY,
+  EXTRA,ORDINAL_POSITION
+FROM
+  INFORMATION_SCHEMA.COLUMNS
+WHERE
+  -- 解析表名
+  TABLE_NAME = 
+    CASE 
+      WHEN ? LIKE '%.%' THEN SUBSTRING_INDEX(?, '.', -1)  -- 获取点号后的部分
+      ELSE ?
+    END
+  -- 解析数据库名
+  AND TABLE_SCHEMA = 
+    CASE 
+      WHEN ? LIKE '%.%' THEN SUBSTRING_INDEX(?, '.', 1)  -- 获取点号前的部分
+      ELSE DATABASE()  -- 默认当前数据库
+    END
+ORDER BY
+  ORDINAL_POSITION`
+		args = []interface{}{table, table, table, table, table}
 
 	case PostgreSQL:
 		// PostgreSQL: 查询主键、注释和序列信息（自增）
-		query = `SELECT 
-			c.column_name, 
-			c.data_type, 
-			c.is_nullable,
-			COALESCE(pgd.description, '') as column_comment,
-			CASE WHEN pk.column_name IS NOT NULL THEN 'PRI' ELSE '' END as column_key,
-			CASE WHEN c.column_default LIKE 'nextval%' THEN 'auto_increment' ELSE '' END as extra
-		FROM information_schema.columns c
-		LEFT JOIN pg_catalog.pg_statio_all_tables st ON c.table_schema = st.schemaname AND c.table_name = st.relname
-		LEFT JOIN pg_catalog.pg_description pgd ON pgd.objoid = st.relid AND pgd.objsubid = c.ordinal_position
-		LEFT JOIN (
-			SELECT ku.column_name
-			FROM information_schema.table_constraints tc
-			JOIN information_schema.key_column_usage ku ON tc.constraint_name = ku.constraint_name
-			WHERE tc.constraint_type = 'PRIMARY KEY' 
-			AND tc.table_schema = current_schema()
-			AND LOWER(tc.table_name) = LOWER(?)
-		) pk ON c.column_name = pk.column_name
-		WHERE c.table_schema = current_schema() 
-		AND LOWER(c.table_name) = LOWER(?) 
-		ORDER BY c.ordinal_position`
-		args = []interface{}{table, table}
+		query = `SELECT
+  a.attname AS column_name,
+  format_type(a.atttypid, a.atttypmod) AS data_type,
+  CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
+  COALESCE(d.description, '') AS column_comment,
+  CASE 
+    WHEN i.indisprimary THEN 'PRI'
+    ELSE ''
+  END AS column_key,
+  CASE
+    -- 详细的自增信息
+    WHEN i.indisprimary THEN
+      CASE
+        WHEN a.attidentity = 'a' THEN 'auto_increment'  -- ALWAYS AS IDENTITY
+        WHEN a.attidentity = 'd' THEN 'auto_increment'  -- BY DEFAULT AS IDENTITY
+        WHEN pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval%' THEN 'auto_increment'  -- SERIAL
+        ELSE ''
+      END
+    WHEN a.attidentity IN ('a', 'd') THEN 'identity'  -- 非主键的IDENTITY列
+    WHEN pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval%' THEN 'sequence'  -- 非主键的SERIAL
+    ELSE ''
+  END AS extra,
+  a.attnum AS ordinal_position
+FROM
+  pg_catalog.pg_attribute a
+  JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
+  JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+  LEFT JOIN pg_catalog.pg_description d 
+    ON d.objoid = c.oid AND d.objsubid = a.attnum
+  LEFT JOIN pg_catalog.pg_attrdef ad 
+    ON ad.adrelid = c.oid AND ad.adnum = a.attnum
+  LEFT JOIN pg_catalog.pg_index i 
+    ON i.indrelid = c.oid 
+    AND a.attnum = ANY(i.indkey)
+    AND i.indisprimary
+WHERE
+  n.nspname = CASE 
+    WHEN ? LIKE '%.%' THEN SPLIT_PART(?, '.', 1)
+    ELSE CURRENT_SCHEMA()
+  END
+  AND c.relname = CASE 
+    WHEN ? LIKE '%.%' THEN SPLIT_PART(?, '.', 2)
+    ELSE ?
+  END
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+ORDER BY
+  a.attnum`
+		args = []interface{}{table, table, table, table, table}
 
 	case SQLite3:
-		// SQLite: PRAGMA table_info 返回 pk 字段（>0 表示主键）
-		// SQLite 的自增通过 INTEGER PRIMARY KEY 自动实现，需要额外查询
+
 		if err := validateIdentifier(table); err != nil {
 			return "", nil
 		}
-		query = "PRAGMA table_info(" + table + ")"
+
+		query = fmt.Sprintf(`SELECT
+  p.name AS column_name,
+  p.type AS data_type,
+  CASE WHEN p.[notnull] = 1 THEN 'NO' ELSE 'YES' END AS is_nullable,
+  '' AS column_comment,
+  CASE WHEN p.pk = 1 THEN 'PRI' ELSE '' END AS column_key,
+  CASE 
+    WHEN p.pk = 1 AND EXISTS (
+      SELECT 1 FROM sqlite_master 
+      WHERE type = 'table' AND name = '%s'
+        AND UPPER(sql) LIKE '%%AUTOINCREMENT%%'
+    ) THEN 'auto_increment'
+    ELSE ''
+  END AS extra,
+  p.cid + 1 AS ordinal_position,
+  p.dflt_value AS column_default
+FROM pragma_table_info('%s') p
+ORDER BY p.cid
+		`, table, table)
 		args = nil
 
 	case SQLServer:
 		// SQL Server: 查询主键、注释和 IDENTITY 信息（自增）
-		query = `SELECT 
-			c.COLUMN_NAME, 
-			c.DATA_TYPE, 
-			c.IS_NULLABLE,
-			COALESCE(ep.value, '') as COLUMN_COMMENT,
-			CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 'PRI' ELSE '' END as COLUMN_KEY,
-			CASE WHEN COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA + '.' + c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') = 1 
-				THEN 'auto_increment' ELSE '' END as EXTRA
-		FROM INFORMATION_SCHEMA.COLUMNS c
-		LEFT JOIN sys.extended_properties ep ON ep.major_id = OBJECT_ID(c.TABLE_SCHEMA + '.' + c.TABLE_NAME)
-			AND ep.minor_id = COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA + '.' + c.TABLE_NAME), c.COLUMN_NAME, 'ColumnId')
-			AND ep.name = 'MS_Description'
-		LEFT JOIN (
-			SELECT ku.COLUMN_NAME
-			FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-			JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE ku ON tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
-			WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' 
-			AND LOWER(tc.TABLE_NAME) = LOWER(?)
-		) pk ON c.COLUMN_NAME = pk.COLUMN_NAME
-		WHERE LOWER(c.TABLE_NAME) = LOWER(?) 
-		ORDER BY c.ORDINAL_POSITION`
-		args = []interface{}{table, table}
+
+		query = ` WITH input_params AS (
+  SELECT 
+    ? AS input_param,
+    CASE 
+      WHEN CHARINDEX('.', ?) > 0 THEN 
+        PARSENAME(?, 2)
+      ELSE 
+        SCHEMA_NAME()
+    END AS schema_name,
+    CASE 
+      WHEN CHARINDEX('.', ?) > 0 THEN 
+        PARSENAME(?, 1)
+      ELSE 
+        ?
+    END AS table_name
+)
+SELECT
+  c.COLUMN_NAME,
+  c.DATA_TYPE,
+  c.IS_NULLABLE,
+  ISNULL(ep.value, '') AS COLUMN_COMMENT,
+  CASE
+    WHEN EXISTS (
+      SELECT 1
+      FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+      JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE ku 
+        ON tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
+      WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+        AND tc.TABLE_SCHEMA = p.schema_name
+        AND tc.TABLE_NAME = p.table_name
+        AND ku.COLUMN_NAME = c.COLUMN_NAME
+    ) THEN 'PRI'
+    ELSE ''
+  END AS COLUMN_KEY,
+  CASE
+    WHEN COLUMNPROPERTY(OBJECT_ID(QUOTENAME(p.schema_name) + '.' + QUOTENAME(p.table_name)), c.COLUMN_NAME, 'IsIdentity') = 1 THEN
+      'auto_increment'
+    ELSE
+      ''
+  END AS EXTRA,
+  c.ORDINAL_POSITION
+FROM input_params p
+JOIN INFORMATION_SCHEMA.COLUMNS c 
+  ON c.TABLE_SCHEMA = p.schema_name 
+  AND c.TABLE_NAME = p.table_name
+LEFT JOIN sys.extended_properties ep 
+  ON ep.major_id = OBJECT_ID(QUOTENAME(p.schema_name) + '.' + QUOTENAME(p.table_name))
+  AND ep.minor_id = COLUMNPROPERTY(OBJECT_ID(QUOTENAME(p.schema_name) + '.' + QUOTENAME(p.table_name)), c.COLUMN_NAME, 'ColumnId')
+  AND ep.name = 'MS_Description'
+  AND ep.class = 1
+ORDER BY c.ORDINAL_POSITION
+		`
+		args = []interface{}{table, table, table, table, table, table}
 
 	case Oracle:
 		// Oracle: 查询主键、注释（兼容 Oracle 11g，不查询 IDENTITY_COLUMN）
