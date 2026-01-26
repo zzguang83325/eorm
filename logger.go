@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -376,8 +377,8 @@ func LogSQL(dbName string, sql string, args []interface{}, duration time.Duratio
 	}
 }
 
-// LogSQLError logs SQL error with execution time
 func LogSQLError(dbName string, sql string, args []interface{}, duration time.Duration, err error) {
+
 	// 自动修复错误信息的编码问题
 	errorMsg := fixStringEncoding(err.Error())
 
@@ -386,11 +387,56 @@ func LogSQLError(dbName string, sql string, args []interface{}, duration time.Du
 		"sql":      cleanSQL(sql),
 		"duration": duration.String(),
 		"error":    errorMsg,
+		"caller":   getCaller(), // 添加调用位置
 	}
 	if len(args) > 0 {
 		fields["args"] = args
 	}
 	currentLogger.Log(LevelError, "SQL failed log", fields)
+}
+
+func getCaller() string {
+	callers := make([]uintptr, 10)
+	count := runtime.Callers(2, callers) // 从第2层开始获取
+	var callerStack []string
+	frames := runtime.CallersFrames(callers)
+	for i := 0; i < count && i < 10; i++ { // 最多显示5层调用
+		frame, more := frames.Next()
+		if !more {
+			break
+		}
+
+		pc := frame.PC
+		file := frame.File
+		line := frame.Line
+
+		// 获取函数名
+		fn := runtime.FuncForPC(pc)
+		funcName := "unknown"
+		if fn != nil {
+			funcName = fn.Name()
+			// 只显示函数名，去掉包路径
+			if idx := strings.LastIndex(funcName, "/"); idx >= 0 {
+				funcName = funcName[idx+1:]
+			}
+			if idx := strings.LastIndex(funcName, "."); idx >= 0 {
+				funcName = funcName[idx+1:]
+			}
+		}
+
+		// 只显示文件名
+		fileName := file
+		if idx := strings.LastIndex(file, "/"); idx >= 0 {
+			fileName = file[idx+1:]
+		}
+		if idx := strings.LastIndex(file, "\\"); idx >= 0 {
+			fileName = file[idx+1:]
+		}
+
+		callerStack = append(callerStack, fmt.Sprintf("%s(%s:%d)", funcName, fileName, line))
+	}
+	callerInfo := " [" + strings.Join(callerStack, " → ") + "]"
+	return callerInfo
 }
 
 // LogInfo logs info message
