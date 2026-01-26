@@ -484,17 +484,16 @@ fmt.Println("JSON:", jsonStr)
 
 #### Record.FromJson
 ```go
-func (r *Record) FromJson(jsonStr string) error
+func (r *Record) FromJson(jsonStr string) *Record
 ```
 从 JSON 字符串解析。
 
 **示例：**
+
 ```go
 record := eorm.NewRecord()
-err := record.FromJson(`{"name":"张三","age":25}`)
-if err != nil {
-    log.Fatal(err)
-}
+record.FromJson(`{"name":"张三","age":25}`).FromJson(`{"address":"xxxxx"}`)
+
 ```
 
 #### Record.ToStruct
@@ -517,20 +516,46 @@ if err != nil {
 }
 ```
 
-#### Record.FromStruct
+
+
+#### Record.FromMap
+
 ```go
-func (r *Record) FromStruct(src interface{}) error
+func (r *Record) FromMap(m map[string]interface{}) *Record
+```
+
+ 将 map 中的数据填充到当前 Record，支持链式调用 。
+
+**示例：**
+
+```go
+record := eorm.NewRecord()
+record.FromMap(map[string]interface{}{
+    "name": "张三",
+    "age": 25,
+}).FromMap(map[string]interface{}{
+    "address": "xxxx",
+    "email": "xxxx@xxx.com",
+}).Set("extra", "value")
+```
+
+
+
+#### Record.FromStruct
+
+```go
+func (r *Record) FromStruct(src interface{}) *Record
 ```
 从结构体填充。
 
 **示例：**
+
 ```go
 user := User{Name: "李四", Age: 30}
+info := Info{Address: "xxxxx", Email: "xxxx@xxx.com"}
 record := eorm.NewRecord()
-err := record.FromStruct(user)
-if err != nil {
-    log.Fatal(err)
-}
+record.FromStruct(user).FromStruct(info)
+
 ```
 
 ---

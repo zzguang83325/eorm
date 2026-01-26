@@ -645,7 +645,7 @@ jsonStr := record.ToJson() // 不返回错误，失败时返回 "{}"
 
 // 从 JSON 创建 Record
 newRecord := eorm.NewRecord()
-err := newRecord.FromJson(jsonStr) // 返回解析错误
+newRecord.FromJson(jsonStr) 
 
 // 删除字段
 record.Remove("is_vip")

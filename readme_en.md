@@ -631,7 +631,7 @@ jsonStr := record.ToJson() // Does not return error, returns "{}" on failure
 
 // Create Record from JSON
 newRecord := eorm.NewRecord()
-err := newRecord.FromJson(jsonStr) // Returns parsing error
+newRecord.FromJson(jsonStr)
 
 // Remove field
 record.Remove("is_vip")
