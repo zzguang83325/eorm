@@ -46,9 +46,9 @@ var (
 
 // 预编译语句缓存相关常量已移至 constants.go
 // 为了向后兼容，保留这些常量的别名
-const (
-	stmtCacheRepository = StmtCacheRepository // 内部使用的缓存名称
-)
+// const (
+// 	stmtCacheRepository = StmtCacheRepository // 内部使用的缓存名称
+// )
 
 // Config holds the database configuration
 type Config struct {
@@ -62,6 +62,9 @@ type Config struct {
 	// 连接监控配置（新增）
 	MonitorNormalInterval time.Duration // 正常检查间隔（默认60秒，0表示禁用监控）
 	MonitorErrorInterval  time.Duration // 故障检查间隔（默认10秒）
+
+	// 预编译语句缓存配置（新增）
+	StmtCacheSize int // 预编译语句缓存大小（默认0表示关闭，大于0表示启用并指定大小）
 }
 
 // SupportedDrivers returns a list of all supported database drivers
@@ -297,6 +300,7 @@ func createDefaultConfig(driver DriverType, dsn string, maxOpen int) *Config {
 		ConnMaxLifetime:       time.Hour,
 		MonitorNormalInterval: 60 * time.Second, // 默认60秒正常检查间隔
 		MonitorErrorInterval:  10 * time.Second, // 默认10秒故障检查间隔
+		StmtCacheSize:         0,                // 默认关闭预编译语句缓存
 	}
 }
 
@@ -453,7 +457,8 @@ func isStmtInvalidError(err error) bool {
 	return strings.Contains(errStr, "invalid connection") ||
 		strings.Contains(errStr, "bad connection") ||
 		strings.Contains(errStr, "connection refused") ||
-		strings.Contains(errStr, "connection reset")
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "statement is closed")
 }
 
 func (mgr *dbManager) query(executor sqlExecutor, querySQL string, args ...interface{}) ([]*Record, error) {
@@ -1049,10 +1054,9 @@ func (mgr *dbManager) getOrderedColumns(record *Record, table string, executor s
 	for col, val := range record.columns {
 
 		// record里面,可能含有一些table里面没有的列,在这里过滤：只保留表真实存在的列（大小写不敏感）
-		if !colSet[strings.ToLower(col)] {
+		if len(colSet) > 0 && !colSet[strings.ToLower(col)] {
 			continue
 		}
-
 		// 只对 SQL Server 和 Oracle 排除自增列
 		// 这两个数据库不允许更新 IDENTITY 列
 		// MySQL/PostgreSQL/SQLite 允许更新自增列（虽然不推荐，但不会报错）
@@ -1098,7 +1102,7 @@ func (mgr *dbManager) getOrderedColumnsForInsert(record *Record, table string, e
 	for col, val := range record.columns {
 
 		// record里面,可能含有一些table里面没有的列,在这里过滤：只保留表真实存在的列（大小写不敏感）
-		if !colSet[strings.ToLower(col)] {
+		if len(colSet) > 0 && !colSet[strings.ToLower(col)] {
 			continue
 		}
 
@@ -3425,6 +3429,13 @@ func (mgr *dbManager) initDB() error {
 
 	// 初始化智能语句缓存
 	cacheConfig := DefaultStmtCacheConfig()
+	if mgr.config.StmtCacheSize > 0 {
+		cacheConfig.Enabled = true
+		cacheConfig.MaxSize = mgr.config.StmtCacheSize
+	} else {
+		cacheConfig.Enabled = false
+	}
+
 	if mgr.config.ConnMaxLifetime > 0 {
 		// 基础 TTL 设为连接生命周期的 80%（比之前的 50% 更激进）
 		cacheConfig.BaseTTL = time.Duration(float64(mgr.config.ConnMaxLifetime) * 0.8)
@@ -3456,7 +3467,8 @@ func (mgr *dbManager) initDB() error {
 			})
 		}
 	}
-
+	// 5. 启动表结构缓存预热
+	go mgr.warmUpColumnCache()
 	return nil
 }
 
@@ -4243,4 +4255,28 @@ func (mgr *dbManager) wrapOracleDatePlaceholders(querySQL string, args []interfa
 	}
 
 	return result.String()
+}
+
+// warmUpColumnCache 自动加载所有表的结构到缓存中
+func (mgr *dbManager) warmUpColumnCache() {
+	tables, err := mgr.getAllTables()
+	if err != nil {
+		LogWarn("预热表结构缓存失败: 获取表名失败", map[string]interface{}{
+			"database": mgr.name,
+			"error":    err.Error(),
+		})
+		return
+	}
+
+	for _, table := range tables {
+		_, err := mgr.getTableColumns(table)
+
+		if err != nil {
+			LogWarn("预热表结构缓存失败", map[string]interface{}{
+				"database": mgr.name,
+				"table":    table,
+				"error":    err.Error(),
+			})
+		}
+	}
 }

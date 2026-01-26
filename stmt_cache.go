@@ -19,7 +19,7 @@ type StmtCacheConfig struct {
 // DefaultStmtCacheConfig 返回默认配置
 func DefaultStmtCacheConfig() StmtCacheConfig {
 	return StmtCacheConfig{
-		Enabled:         true,
+		Enabled:         false, // 默认关闭
 		MaxSize:         1000,
 		Strategy:        "lru",
 		CleanupInterval: 0, // 默认禁用定时清理，仅惰性删除
@@ -82,12 +82,12 @@ func (c *stmtCache) Get(key string) (*sql.Stmt, bool) {
 
 	// 检查是否过期（可选的安全网机制）
 	// 注意：BaseTTL = 0 表示禁用 TTL，完全依赖 LRU 淘汰
-	if c.config.BaseTTL > 0 && time.Since(entry.createdAt) > c.config.BaseTTL {
-		// 过期，删除并关闭
-		c.removeEntry(key, entry)
-		c.misses++
-		return nil, false
-	}
+	// if c.config.BaseTTL > 0 && time.Since(entry.createdAt) > c.config.BaseTTL {
+	// 	// 过期，删除并关闭
+	// 	c.removeEntry(key, entry)
+	// 	c.misses++
+	// 	return nil, false
+	// }
 
 	// 更新访问信息
 	entry.lastUsedAt = time.Now()
@@ -115,9 +115,22 @@ func (c *stmtCache) Set(key string, stmt *sql.Stmt, query string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// 如果已存在，先删除旧的
+	// 如果已存在，说明已经有同一条 SQL 的缓存
+	// 为避免并发覆盖导致正在使用的 stmt 被提前关闭，这里复用旧 entry：
+	// - 更新访问时间和计数
+	// - 把 LRU 节点移动到头部
+	// - 直接返回，不用新 stmt 替换旧的
 	if oldEntry, exists := c.items[key]; exists {
-		c.removeEntry(key, oldEntry)
+		// if stmt != nil && stmt != oldEntry.stmt {
+		// 	stmt.Close()
+		// }
+		now := time.Now()
+		oldEntry.lastUsedAt = now
+		oldEntry.accessCount++
+		if c.config.Strategy == "lru" && oldEntry.listElement != nil {
+			c.lruList.MoveToFront(oldEntry.listElement)
+		}
+		return
 	}
 
 	// 检查容量，必要时淘汰
@@ -196,6 +209,7 @@ func (c *stmtCache) Stats() map[string]interface{} {
 // evictOne 淘汰一个条目（内部方法，需持锁调用）
 func (c *stmtCache) evictOne() {
 	if c.config.Strategy == "lru" {
+
 		// LRU：淘汰链表尾部（最久未使用）
 		if elem := c.lruList.Back(); elem != nil {
 			key := elem.Value.(string)
@@ -206,6 +220,7 @@ func (c *stmtCache) evictOne() {
 		}
 	} else {
 		// TTL：淘汰最早创建的
+
 		var oldestKey string
 		var oldestTime time.Time
 
@@ -228,9 +243,10 @@ func (c *stmtCache) evictOne() {
 // removeEntry 移除条目（内部方法，需持锁调用）
 func (c *stmtCache) removeEntry(key string, entry *stmtCacheEntry) {
 	// 关闭语句
-	if entry.stmt != nil {
-		entry.stmt.Close()
-	}
+
+	// if entry.stmt != nil {
+	// 	entry.stmt.Close()
+	// }
 
 	// 从 LRU 链表移除
 	if entry.listElement != nil {
