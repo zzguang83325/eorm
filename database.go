@@ -3450,6 +3450,9 @@ func (mgr *dbManager) initDB() error {
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return err
+	} else {
+		//启动表结构缓存预热
+		go mgr.warmUpColumnCache()
 	}
 
 	// 4. 将成功初始化的连接赋值给 mgr.db (持锁以保证原子性)
@@ -3467,8 +3470,7 @@ func (mgr *dbManager) initDB() error {
 			})
 		}
 	}
-	// 5. 启动表结构缓存预热
-	go mgr.warmUpColumnCache()
+
 	return nil
 }
 
@@ -4259,8 +4261,13 @@ func (mgr *dbManager) wrapOracleDatePlaceholders(querySQL string, args []interfa
 
 // warmUpColumnCache 自动加载所有表的结构到缓存中
 func (mgr *dbManager) warmUpColumnCache() {
+	// 1. 获取所有表名
 	tables, err := mgr.getAllTables()
 	if err != nil {
+		// 如果数据库已经关闭，静默退出
+		if err.Error() == "sql: database is closed" {
+			return
+		}
 		LogWarn("预热表结构缓存失败: 获取表名失败", map[string]interface{}{
 			"database": mgr.name,
 			"error":    err.Error(),
@@ -4268,10 +4275,19 @@ func (mgr *dbManager) warmUpColumnCache() {
 		return
 	}
 
+	// 2. 遍历预热
 	for _, table := range tables {
-		_, err := mgr.getTableColumns(table)
+		// 检查数据库是否已关闭
+		if mgr.db == nil {
+			return
+		}
 
+		_, err := mgr.getTableColumns(table)
 		if err != nil {
+			// 如果在预热过程中数据库关闭了，直接退出，不报警告
+			if err.Error() == "sql: database is closed" {
+				return
+			}
 			LogWarn("预热表结构缓存失败", map[string]interface{}{
 				"database": mgr.name,
 				"table":    table,
