@@ -1,4 +1,4 @@
-module github.com/zzguang83325/dbkit/redis
+module github.com/zzguang83325/eorm/redis
 
 go 1.25.5
 

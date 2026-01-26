@@ -88,7 +88,7 @@ func NewRedisCacheWithOptions(opts *redis.Options) (*redisCache, error) {
 // CacheGet 从 Redis 获取缓存值
 // 优化：直接返回 JSON 字节数组，避免字符串转换开销
 func (r *redisCache) CacheGet(cacheRepositoryName, key string) (interface{}, bool) {
-	fullKey := fmt.Sprintf("dbkit:%s:%s", cacheRepositoryName, key)
+	fullKey := fmt.Sprintf("eorm:%s:%s", cacheRepositoryName, key)
 
 	// 使用 Bytes() 而不是 Result()，避免字符串转换
 	val, err := r.client.Get(r.ctx, fullKey).Bytes()
@@ -104,7 +104,7 @@ func (r *redisCache) CacheGet(cacheRepositoryName, key string) (interface{}, boo
 }
 
 func (r *redisCache) CacheSet(cacheRepositoryName, key string, value interface{}, ttl time.Duration) {
-	fullKey := fmt.Sprintf("dbkit:%s:%s", cacheRepositoryName, key)
+	fullKey := fmt.Sprintf("eorm:%s:%s", cacheRepositoryName, key)
 
 	var data interface{} = value
 	switch value.(type) {
@@ -114,7 +114,7 @@ func (r *redisCache) CacheSet(cacheRepositoryName, key string, value interface{}
 		jsonData, err := json.Marshal(value)
 		if err != nil {
 			// 序列化失败，记录日志并跳过存储
-			fmt.Printf("dbkit: redis cache marshal failed, key=%s, error=%v\n", fullKey, err)
+			fmt.Printf("eorm: redis cache marshal failed, key=%s, error=%v\n", fullKey, err)
 			return
 		}
 		data = jsonData
@@ -127,7 +127,7 @@ func (r *redisCache) CacheDelete(cacheRepositoryName, key string) {
 	if cacheRepositoryName == "" || key == "" {
 		return // 忽略空参数
 	}
-	fullKey := fmt.Sprintf("dbkit:%s:%s", cacheRepositoryName, key)
+	fullKey := fmt.Sprintf("eorm:%s:%s", cacheRepositoryName, key)
 	r.client.Del(r.ctx, fullKey)
 }
 
@@ -136,16 +136,16 @@ func (r *redisCache) CacheClearRepository(cacheRepositoryName string) {
 	if cacheRepositoryName == "" {
 		return // 忽略空字符串，避免误删除所有缓存
 	}
-	pattern := fmt.Sprintf("dbkit:%s:*", cacheRepositoryName)
+	pattern := fmt.Sprintf("eorm:%s:*", cacheRepositoryName)
 	iter := r.client.Scan(r.ctx, 0, pattern, 0).Iterator()
 	for iter.Next(r.ctx) {
 		r.client.Del(r.ctx, iter.Val())
 	}
 }
 
-// ClearAll 清空所有 dbkit 相关的缓存
+// ClearAll 清空所有 eorm 相关的缓存
 func (r *redisCache) ClearAll() {
-	pattern := "dbkit:*"
+	pattern := "eorm:*"
 	iter := r.client.Scan(r.ctx, 0, pattern, 0).Iterator()
 	for iter.Next(r.ctx) {
 		r.client.Del(r.ctx, iter.Val())
