@@ -319,8 +319,16 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 }
 
 // FromJson parses JSON string into the Record
-func (r *Record) FromJson(jsonStr string) error {
-	return r.UnmarshalJSON([]byte(jsonStr))
+func (r *Record) FromJson(jsonStr string) *Record {
+	tempData := make(map[string]interface{})
+	if err := json.Unmarshal([]byte(jsonStr), &tempData); err != nil {
+		return r // 静默处理错误，保持链式调用
+	}
+	// 使用 Set 方法合并数据
+	for k, v := range tempData {
+		r.Set(k, v)
+	}
+	return r
 }
 
 // ToStruct converts the Record to a struct
@@ -329,8 +337,9 @@ func (r *Record) ToStruct(dest interface{}) error {
 }
 
 // FromStruct populates the Record from a struct
-func (r *Record) FromStruct(src interface{}) error {
-	return FromStruct(src, r)
+func (r *Record) FromStruct(src interface{}) *Record {
+	_ = FromStruct(src, r)
+	return r
 }
 
 // Str returns the column name in string format
