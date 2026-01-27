@@ -611,8 +611,8 @@ func (cw *colorWriter) Write(p []byte) (n int, err error) {
 			first = false
 			processedKeys[key] = true
 
-			// 写入键
-			builder.WriteString(fmt.Sprintf("\"%s\":", key))
+			// 写入键（字段名用洋红色高亮）
+			builder.WriteString(fmt.Sprintf("\"\033[35m%s\033[0m\":", key))
 
 			// 根据键添加颜色
 			var coloredValue string
@@ -641,8 +641,8 @@ func (cw *colorWriter) Write(p []byte) (n int, err error) {
 				// 数据库名用青色
 				coloredValue = "\033[96m" + fmt.Sprintf("%v", value) + "\033[0m"
 			case "duration":
-				// 持续时间用紫色
-				coloredValue = "\033[95m" + fmt.Sprintf("%v", value) + "\033[0m"
+				// 持续时间用蓝色
+				coloredValue = "\033[34m" + fmt.Sprintf("%v", value) + "\033[0m"
 			case "args":
 				// 参数用黄色
 				coloredValue = "\033[33m" + fmt.Sprintf("%v", value) + "\033[0m"
@@ -685,12 +685,22 @@ func (cw *colorWriter) Write(p []byte) (n int, err error) {
 		}
 		first = false
 
-		// 写入键
-		builder.WriteString(fmt.Sprintf("\"%s\":", key))
+		// 写入键（字段名用洋红色高亮）
+		builder.WriteString(fmt.Sprintf("\"\033[35m%s\033[0m\":", key))
 
-		// 其他字段保持原样，需要 JSON 编码
-		jsonBytes, _ := json.Marshal(value)
-		builder.WriteString(string(jsonBytes))
+		// 为字符串类型的字段添加颜色
+		var coloredValue string
+		switch v := value.(type) {
+		case string:
+			// 字符串用亮青色
+			coloredValue = "\033[96m" + v + "\033[0m"
+			escapedValue := strings.ReplaceAll(coloredValue, "\"", "\\\"")
+			builder.WriteString(fmt.Sprintf("\"%s\"", escapedValue))
+		default:
+			// 其他类型保持原样，需要 JSON 编码
+			jsonBytes, _ := json.Marshal(value)
+			builder.WriteString(string(jsonBytes))
+		}
 	}
 
 	builder.WriteString("}")
@@ -704,4 +714,13 @@ func InitLoggerWithFile(level string, filePath string) {
 		OutputToFile: true,
 		Filepath:     filePath,
 	})
+}
+
+func init() {
+	// 设置默认的 JSON 格式 logger，启用颜色输出
+	colorOutput := newColorWriter(os.Stdout, slog.LevelInfo)
+	handler := slog.NewJSONHandler(colorOutput, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})
+	slog.SetDefault(slog.New(handler))
 }
