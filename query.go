@@ -674,6 +674,7 @@ func (db *DB) BatchExec(sqls []string, args ...[]interface{}) ([]StatementResult
 	return db.dbMgr.batchExecWithContext(ctx, sdb, sqls, actualArgs)
 }
 
+// 如果是单一 int64 主键且数据库返回了 ID，会自动回填到 record 中
 func (db *DB) SaveRecord(table string, record *Record) (int64, error) {
 	if db.lastErr != nil {
 		return 0, db.lastErr
@@ -696,6 +697,7 @@ func (db *DB) SaveRecord(table string, record *Record) (int64, error) {
 	return id, err
 }
 
+// 如果是单一 int64 主键且数据库返回了 ID，会自动回填到 record 中
 func (db *DB) InsertRecord(table string, record *Record) (int64, error) {
 	if db.lastErr != nil {
 		return 0, db.lastErr

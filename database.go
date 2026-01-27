@@ -342,7 +342,7 @@ func OpenDatabaseWithConfig(dbname string, config *Config) (*DB, error) {
 		multiMgr.currentDB = dbname
 	}
 	multiMgr.mu.Unlock()
-
+	go dbMgr.warmUpColumnCache()
 	// 返回新创建的DB实例
 	return &DB{dbMgr: dbMgr}, nil
 }
@@ -3453,7 +3453,7 @@ func (mgr *dbManager) initDB() error {
 		return err
 	} else {
 		//启动表结构缓存预热
-		go mgr.warmUpColumnCache()
+
 	}
 
 	// 4. 将成功初始化的连接赋值给 mgr.db (持锁以保证原子性)
@@ -3487,6 +3487,7 @@ func (mgr *dbManager) getDB() (*sql.DB, error) {
 			return nil, fmt.Errorf("eorm: failed to initialize database: %w", err)
 		}
 	}
+
 	return mgr.db, nil
 }
 
@@ -4265,6 +4266,7 @@ func (mgr *dbManager) warmUpColumnCache() {
 
 	// 1. 获取所有表名
 	tables, err := mgr.getAllTables()
+
 	if err != nil {
 		// 如果数据库已经关闭，静默退出
 		if err.Error() == "sql: database is closed" {
