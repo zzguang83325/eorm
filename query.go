@@ -686,6 +686,13 @@ func (db *DB) SaveRecord(table string, record *Record) (int64, error) {
 	if err == nil && db.cacheRepositoryName != "" {
 		db.ClearCache(db.cacheRepositoryName)
 	}
+	pks, _ := db.dbMgr.getPrimaryKeys(sdb, table)
+	if len(pks) == 1 && db.dbMgr.isInt64PrimaryKey(table, pks[0]) {
+		if !record.Has(pks[0]) {
+			record.Set(pks[0], id) // 把ID回填到record
+		}
+	}
+
 	return id, err
 }
 
@@ -697,7 +704,31 @@ func (db *DB) InsertRecord(table string, record *Record) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return db.dbMgr.insertRecord(sdb, table, record)
+	id, err := db.dbMgr.insertRecord(sdb, table, record)
+	if err == nil && db.cacheRepositoryName != "" {
+		db.ClearCache(db.cacheRepositoryName)
+	}
+	pks, _ := db.dbMgr.getPrimaryKeys(sdb, table)
+	if len(pks) == 1 && db.dbMgr.isInt64PrimaryKey(table, pks[0]) {
+		if !record.Has(pks[0]) {
+			record.Set(pks[0], id) // 把ID回填到record
+		}
+	}
+
+	return id, err
+}
+
+func (db *DB) UpdateRecord(table string, record *Record) (int64, error) {
+	if db.lastErr != nil {
+		return 0, db.lastErr
+	}
+	sdb, err := db.dbMgr.getDB()
+	if err != nil {
+		return 0, err
+	}
+	id, err := db.dbMgr.updateRecord(sdb, table, record)
+
+	return id, err
 }
 
 func (db *DB) insertWithOptions(table string, record *Record, skipTimestamps bool) (int64, error) {
@@ -755,17 +786,6 @@ func (db *DB) updateWithOptions(table string, record *Record, whereSql string, s
 		return 0, err
 	}
 	return db.dbMgr.updateRecordWithOptions(sdb, table, record, whereSql, skipTimestamps, whereArgs...)
-}
-
-func (db *DB) UpdateRecord(table string, record *Record) (int64, error) {
-	if db.lastErr != nil {
-		return 0, db.lastErr
-	}
-	sdb, err := db.dbMgr.getDB()
-	if err != nil {
-		return 0, err
-	}
-	return db.dbMgr.updateRecord(sdb, table, record)
 }
 
 func (db *DB) Delete(table string, whereSql string, whereArgs ...interface{}) (int64, error) {
@@ -1022,7 +1042,10 @@ func (db *DB) SaveDbModel(model IDbModel) (int64, error) {
 			record.Remove(pk)
 		}
 	}
-	return db.SaveRecord(model.TableName(), record)
+	id, err := db.SaveRecord(model.TableName(), record)
+
+	record.ToStruct(model)
+	return id, err
 }
 
 func (db *DB) InsertDbModel(model IDbModel) (int64, error) {
@@ -1041,7 +1064,12 @@ func (db *DB) InsertDbModel(model IDbModel) (int64, error) {
 			record.Remove(pk)
 		}
 	}
-	return db.InsertRecord(model.TableName(), record)
+
+	id, err := db.InsertRecord(model.TableName(), record)
+
+	record.ToStruct(model)
+
+	return id, err
 }
 
 func (db *DB) UpdateDbModel(model IDbModel) (int64, error) {

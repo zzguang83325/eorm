@@ -4261,6 +4261,7 @@ func (mgr *dbManager) wrapOracleDatePlaceholders(querySQL string, args []interfa
 
 // warmUpColumnCache 自动加载所有表的结构到缓存中
 func (mgr *dbManager) warmUpColumnCache() {
+
 	// 1. 获取所有表名
 	tables, err := mgr.getAllTables()
 	if err != nil {
@@ -4282,7 +4283,7 @@ func (mgr *dbManager) warmUpColumnCache() {
 			return
 		}
 
-		_, err := mgr.getTableColumns(table)
+		columns, err := mgr.getTableColumns(table)
 		if err != nil {
 			// 如果在预热过程中数据库关闭了，直接退出，不报警告
 			if err.Error() == "sql: database is closed" {
@@ -4293,6 +4294,18 @@ func (mgr *dbManager) warmUpColumnCache() {
 				"table":    table,
 				"error":    err.Error(),
 			})
+		}
+
+		if debug {
+			for _, col := range columns {
+
+				LogDebug("预热表结构"+table, map[string]interface{}{
+
+					"列":  col.Name,
+					"类型": col.Type,
+					"备注": col.Comment,
+				})
+			}
 		}
 	}
 }
