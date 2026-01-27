@@ -1221,8 +1221,9 @@ func (mgr *dbManager) nativeUpsert(executor sqlExecutor, table string, record *R
 
 	// 处理 PostgreSQL 的 ID 返回
 	if driver == PostgreSQL {
-		if len(pks) == 1 && strings.EqualFold(pks[0], "id") {
-			sqlStr += " RETURNING id"
+
+		if len(pks) == 1 && mgr.isInt64PrimaryKey(table, pks[0]) {
+			sqlStr += " RETURNING  " + pks[0]
 			var id int64
 			start := time.Now()
 			err := executor.QueryRow(sqlStr, values...).Scan(&id)
