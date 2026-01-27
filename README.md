@@ -235,29 +235,7 @@ err = eorm.Table("users").QueryToDbModel(&queryUsers)
 
 
 
-## 📁 示例目录
-
-eorm 提供了针对各种数据库的详细示例，您可以在 `examples/` 目录中找到：
-
-- `examples/mysql/` - MySQL 数据库使用示例
-- `examples/postgres/` - PostgreSQL 数据库使用示例
-- `examples/sqlite/` - SQLite 数据库使用示例
-- `examples/oracle/` - Oracle 数据库使用示例
-- `examples/sqlserver/` - SQL Server 数据库使用示例
-- `examples/cache_redis/` - Redis缓存使用示例
-- `examples/log/` - Sql日志使用示例
-- `examples/sql_template/` - Sql模板使用示例
-- `examples/soft_delete/` - 软删除使用示例
-- `examples/timestamp/` - 自动时间戳使用示例
-- `examples/optimistic_lock/` - 乐观锁使用示例
-- `examples/comprehensive/` - 综合使用示例
-
-您可以通过运行以下命令来测试这些示例：
-
-```bash
-cd examples/mysql
-go run main.go
-```
+## 
 
 ## 📖 基本使用文档
 

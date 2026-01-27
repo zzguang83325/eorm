@@ -225,29 +225,7 @@ err = eorm.QueryToDbModel(&queryUsers, "SELECT * FROM users WHERE age > ?", 25)
 err = eorm.Table("users").QueryToDbModel(&queryUsers)
 ```
 
-## 📁 Example Directory
-
-eorm provides detailed examples for various databases. You can find them in the `examples/` directory:
-
-- `examples/mysql/` - MySQL database usage examples
-- `examples/postgres/` - PostgreSQL database usage examples
-- `examples/sqlite/` - SQLite database usage examples
-- `examples/oracle/` - Oracle database usage examples
-- `examples/sqlserver/` - SQL Server database usage examples
-- `examples/cache_redis/` - Redis cache usage examples
-- `examples/log/` - SQL log usage examples
-- `examples/sql_template/` - SQL template usage examples
-- `examples/soft_delete/` - Soft delete usage examples
-- `examples/timestamp/` - Auto timestamp usage examples
-- `examples/optimistic_lock/` - Optimistic lock usage examples
-- `examples/comprehensive/` - Comprehensive usage examples
-
-You can test these examples by running the following command:
-
-```bash
-cd examples/mysql
-go run main.go
-```
+## 
 
 ## 📖 Basic Usage Documentation
 
