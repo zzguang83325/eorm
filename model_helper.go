@@ -14,9 +14,9 @@ var (
 
 // ModelCache 用于在 Model 中存储缓存配置，可嵌入到生成的 Model 中
 type ModelCache struct {
-	CacheRepositoryName string
-	CacheTTL            time.Duration
-	CountCacheTTL       time.Duration // 分页计数缓存时间
+	CacheRepositoryName string        `json:"-"`
+	CacheTTL            time.Duration `json:"-"`
+	CountCacheTTL       time.Duration `json:"-"` // 分页计数缓存时间
 }
 
 // SetCache 设置缓存名称和TTL
