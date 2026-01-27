@@ -342,7 +342,7 @@ func OpenDatabaseWithConfig(dbname string, config *Config) (*DB, error) {
 		multiMgr.currentDB = dbname
 	}
 	multiMgr.mu.Unlock()
-	go dbMgr.warmUpColumnCache()
+	dbMgr.warmUpColumnCache()
 	// 返回新创建的DB实例
 	return &DB{dbMgr: dbMgr}, nil
 }
@@ -4286,7 +4286,7 @@ func (mgr *dbManager) warmUpColumnCache() {
 			return
 		}
 
-		columns, err := mgr.getTableColumns(table)
+		_, err := mgr.getTableColumns(table)
 		if err != nil {
 			// 如果在预热过程中数据库关闭了，直接退出，不报警告
 			if err.Error() == "sql: database is closed" {
@@ -4299,16 +4299,16 @@ func (mgr *dbManager) warmUpColumnCache() {
 			})
 		}
 
-		if debug {
-			for _, col := range columns {
+		// if debug {
+		// 	for _, col := range columns {
 
-				LogDebug("预热表结构"+table, map[string]interface{}{
+		// 		LogDebug("预热表结构"+table, map[string]interface{}{
 
-					"列":  col.Name,
-					"类型": col.Type,
-					"备注": col.Comment,
-				})
-			}
-		}
+		// 			"列":  col.Name,
+		// 			"类型": col.Type,
+		// 			"备注": col.Comment,
+		// 		})
+		// 	}
+		// }
 	}
 }

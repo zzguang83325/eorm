@@ -2,6 +2,7 @@ package eorm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -347,7 +348,10 @@ func SetDebugMode(enabled bool) {
 	if enabled {
 		// 如果全局 slog 还不支持 Debug 级别，则强制设置一个输出到标准输出的 Debug 级别 slog
 		if !slog.Default().Enabled(context.Background(), slog.LevelDebug) {
-			slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			// 使用带颜色的输出
+			colorOutput := newColorWriter(os.Stdout, slog.LevelDebug)
+			handler := slog.NewJSONHandler(colorOutput, &slog.HandlerOptions{Level: slog.LevelDebug})
+			slog.SetDefault(slog.New(handler))
 		}
 	}
 }
@@ -487,7 +491,25 @@ func Sync() {
 // InitLogger initializes the logger with a specific level to stdout
 // InitLogger initializes the global slog logger with a specific level to console
 func InitLogger(level string) {
-	// Determine log level
+	InitLoggerWithOptions(level, LoggerOptions{
+		EnableColor:  true,
+		OutputToFile: false,
+		Filepath:     "",
+	})
+}
+
+// LoggerOptions 日志配置选项
+type LoggerOptions struct {
+	EnableColor  bool
+	OutputToFile bool
+	Filepath     string
+	TimeFormat   string
+	ShowCaller   bool
+}
+
+// InitLoggerWithOptions 带配置的日志初始化
+func InitLoggerWithOptions(level string, opts LoggerOptions) {
+	// 确定日志级别
 	slogLevel := slog.LevelInfo
 	if strings.EqualFold(level, "debug") {
 		slogLevel = slog.LevelDebug
@@ -498,44 +520,188 @@ func InitLogger(level string) {
 		slogLevel = slog.LevelError
 	}
 
-	// Set global slog default with TextHandler to stdout
-	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slogLevel,
-	})
+	// 设置时间格式
+	timeFormat := opts.TimeFormat
+	if timeFormat == "" {
+		timeFormat = time.RFC3339
+	}
+
+	// 创建输出
+	var output io.Writer
+	if opts.OutputToFile && opts.Filepath != "" {
+		file, err := os.OpenFile(opts.Filepath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "eorm: Failed to open log file: %v\n", err)
+			output = os.Stdout
+		} else {
+			if opts.EnableColor {
+				// 控制台带颜色,文件无颜色
+				multiWriter := io.MultiWriter(
+					newColorWriter(os.Stdout, slogLevel),
+					file,
+				)
+				output = multiWriter
+			} else {
+				output = io.MultiWriter(os.Stdout, file)
+			}
+		}
+	} else {
+		if opts.EnableColor {
+			output = newColorWriter(os.Stdout, slogLevel)
+		} else {
+			output = os.Stdout
+		}
+	}
+
+	// 创建 Handler
+	handlerOpts := &slog.HandlerOptions{
+		Level:     slogLevel,
+		AddSource: opts.ShowCaller,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				if t, ok := a.Value.Any().(time.Time); ok {
+					a.Value = slog.StringValue(t.Format(timeFormat))
+				}
+			}
+			return a
+		},
+	}
+
+	handler := slog.NewJSONHandler(output, handlerOpts)
 	slog.SetDefault(slog.New(handler))
 
 	// Reset currentLogger to use the new global default
 	SetLogger(&slogLogger{logger: nil})
 }
 
+// colorWriter 带颜色的输出包装器
+type colorWriter struct {
+	w     io.Writer
+	level slog.Level
+}
+
+func newColorWriter(w io.Writer, level slog.Level) *colorWriter {
+	return &colorWriter{w: w, level: level}
+}
+
+func (cw *colorWriter) Write(p []byte) (n int, err error) {
+	// 使用 JSON 解析
+	var data map[string]interface{}
+	if err := json.Unmarshal(p, &data); err != nil {
+		// 如果解析失败，直接输出原内容
+		return cw.w.Write(p)
+	}
+
+	// 定义字段顺序
+	fieldOrder := []string{"time", "level", "msg", "db", "sql", "args", "duration", "error", "caller"}
+
+	// 手动构建 JSON 字符串，避免 ANSI 代码被转义
+	var builder strings.Builder
+	builder.WriteString("{")
+
+	first := true
+	processedKeys := make(map[string]bool)
+
+	// 按照预定义顺序输出字段
+	for _, key := range fieldOrder {
+		if value, exists := data[key]; exists {
+			if !first {
+				builder.WriteString(",")
+			}
+			first = false
+			processedKeys[key] = true
+
+			// 写入键
+			builder.WriteString(fmt.Sprintf("\"%s\":", key))
+
+			// 根据键添加颜色
+			var coloredValue string
+			switch key {
+			case "level":
+				// 日志级别根据值设置不同颜色
+				levelStr := fmt.Sprintf("%v", value)
+				var colorCode string
+				switch levelStr {
+				case "DEBUG":
+					colorCode = "\033[36m" // 青色
+				case "INFO":
+					colorCode = "\033[30m" // 灰色
+				case "WARN":
+					colorCode = "\033[33m" // 黄色
+				case "ERROR":
+					colorCode = "\033[31m" // 红色
+				default:
+					colorCode = "\033[0m"
+				}
+				coloredValue = colorCode + levelStr + "\033[0m"
+			case "sql":
+				// SQL 用绿色
+				coloredValue = "\033[32m" + fmt.Sprintf("%v", value) + "\033[0m"
+			case "db":
+				// 数据库名用青色
+				coloredValue = "\033[96m" + fmt.Sprintf("%v", value) + "\033[0m"
+			case "duration":
+				// 持续时间用紫色
+				coloredValue = "\033[95m" + fmt.Sprintf("%v", value) + "\033[0m"
+			case "args":
+				// 参数用黄色
+				coloredValue = "\033[33m" + fmt.Sprintf("%v", value) + "\033[0m"
+			case "error":
+				// 错误用亮红色
+				coloredValue = "\033[91m" + fmt.Sprintf("%v", value) + "\033[0m"
+			case "caller":
+				// 调用者用灰色
+				coloredValue = "\033[90m" + fmt.Sprintf("%v", value) + "\033[0m"
+			default:
+				// 其他字段保持原样，需要 JSON 编码
+				jsonBytes, _ := json.Marshal(value)
+				coloredValue = string(jsonBytes)
+			}
+
+			// 写入值（字符串需要加引号）
+			if key == "level" || key == "sql" || key == "db" || key == "duration" || key == "args" || key == "error" || key == "caller" {
+				// 这些字段需要转义引号
+				escapedValue := strings.ReplaceAll(coloredValue, "\"", "\\\"")
+				builder.WriteString(fmt.Sprintf("\"%s\"", escapedValue))
+			} else {
+				builder.WriteString(coloredValue)
+			}
+		}
+	}
+
+	// 输出剩余的字段（按字母顺序）
+	var remainingKeys []string
+	for key := range data {
+		if !processedKeys[key] {
+			remainingKeys = append(remainingKeys, key)
+		}
+	}
+	sort.Strings(remainingKeys)
+
+	for _, key := range remainingKeys {
+		value := data[key]
+		if !first {
+			builder.WriteString(",")
+		}
+		first = false
+
+		// 写入键
+		builder.WriteString(fmt.Sprintf("\"%s\":", key))
+
+		// 其他字段保持原样，需要 JSON 编码
+		jsonBytes, _ := json.Marshal(value)
+		builder.WriteString(string(jsonBytes))
+	}
+
+	builder.WriteString("}")
+	return cw.w.Write([]byte(builder.String() + "\n"))
+}
+
 // InitLoggerWithFile initializes the logger to both console and a file using slog
 func InitLoggerWithFile(level string, filePath string) {
-	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eorm: Failed to open log file: %v\n", err)
-		return
-	}
-
-	// Determine log level
-	slogLevel := slog.LevelInfo
-	if strings.EqualFold(level, "debug") {
-		slogLevel = slog.LevelDebug
-		SetDebugMode(true)
-	} else if strings.EqualFold(level, "warn") {
-		slogLevel = slog.LevelWarn
-	} else if strings.EqualFold(level, "error") {
-		slogLevel = slog.LevelError
-	}
-
-	// Create a multi-writer for both console and file
-	multiWriter := io.MultiWriter(os.Stdout, file)
-
-	// Set global slog default with TextHandler
-	handler := slog.NewTextHandler(multiWriter, &slog.HandlerOptions{
-		Level: slogLevel,
+	InitLoggerWithOptions(level, LoggerOptions{
+		EnableColor:  true,
+		OutputToFile: true,
+		Filepath:     filePath,
 	})
-	slog.SetDefault(slog.New(handler))
-
-	// Reset currentLogger to use the new global default
-	SetLogger(&slogLogger{logger: nil})
 }
