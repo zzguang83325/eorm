@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 )
 
 type noCopy struct{}
@@ -239,14 +240,63 @@ func (r *Record) ToJson() string {
 	return string(data)
 }
 
-// MarshalJSON implements the json.Marshaler interface
 func (r *Record) MarshalJSON() ([]byte, error) {
 	if r == nil {
 		return []byte("{}"), nil
 	}
+
+	// 使用递归转换
+	data, err := json.Marshal(r.toMapRecursive(make(map[uintptr]bool), 0))
+	if err != nil {
+		return []byte("{}"), err
+	}
+	return data, nil
+}
+
+func (r *Record) toMapRecursive(visited map[uintptr]bool, depth int) map[string]interface{} {
+	const maxDepth = 100
+	if depth > maxDepth {
+		return map[string]interface{}{"__error": "max recursion depth exceeded"}
+	}
+
+	if r == nil {
+		return nil
+	}
+
+	// 循环引用检测
+	currentPtr := uintptr(unsafe.Pointer(r))
+	if visited[currentPtr] {
+		return map[string]interface{}{"__error": "circular reference"}
+	}
+	visited[currentPtr] = true
+	defer delete(visited, currentPtr)
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return json.Marshal(r.columns)
+
+	// 空记录快速返回
+	if len(r.columns) == 0 {
+		return map[string]interface{}{}
+	}
+
+	result := make(map[string]interface{}, len(r.columns))
+	for k, v := range r.columns {
+		// 处理嵌套 Record
+		switch val := v.(type) {
+		case *Record:
+			if val != nil {
+				result[k] = val.toMapRecursive(visited, depth+1)
+			} else {
+				result[k] = nil
+			}
+		case Record:
+			result[k] = (&val).toMapRecursive(visited, depth+1)
+		default:
+			result[k] = v
+		}
+	}
+
+	return result
 }
 
 // Clone creates a deep copy of the Record
