@@ -573,7 +573,7 @@ ids := []interface{}{1, 2, 3, 4, 5}
 eorm.BatchDeleteByIds("users", ids)
 ```
 
-### 4. Record Object Details
+### 4. Record Object 
 
 `Record` is the core of eorm, it is like an enhanced version of `map[string]interface{}`. No need to define structs to operate on database tables, Record field names are case-insensitive.
 

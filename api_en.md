@@ -384,16 +384,21 @@ func (r *Record) Get(column string) interface{}
 ```
 Get field value.
 
-#### Type-safe getter methods
+#### Type-safe Get Methods
 ```go
 func (r *Record) GetString(column string) string
 func (r *Record) GetInt(column string) int
 func (r *Record) GetInt64(column string) int64
+func (r *Record) GetInt32(column string) int32
+func (r *Record) GetInt16(column string) int16
+func (r *Record) GetUint(column string) uint
 func (r *Record) GetFloat(column string) float64
-func (r *Record) GetBool(column string) bool
+func (r *Record) GetFloat32(column string) float32
+func (r *Record) GetBytes(column string) []byte
 func (r *Record) GetTime(column string) time.Time
+func (r *Record) GetBool(column string) bool
 
-// Shorthand methods
+// Shorthand methods (backward compatible, no error return)
 func (r *Record) Str(column string) string
 func (r *Record) Int(column string) int
 func (r *Record) Int64(column string) int64
@@ -434,6 +439,18 @@ Get all field names.
 ```go
 keys := record.Keys()
 fmt.Println("Field list:", keys)
+```
+
+#### Record.Columns
+```go
+func (r *Record) Columns() []string
+```
+Get all field names (alias method, same as Keys).
+
+**Example:**
+```go
+columns := record.Columns()
+fmt.Println("Field list:", columns)
 ```
 
 #### Record.Remove
@@ -486,12 +503,12 @@ fmt.Println("JSON:", jsonStr)
 ```go
 func (r *Record) FromJson(jsonStr string) *Record
 ```
-Parse from JSON string.
+Parse from JSON string and merge into current Record.
 
 **Example:**
 ```go
 record := eorm.NewRecord()
-record.FromJson(`{"name":"张三","age":25}`).FromJson(`{"address":"xxxxx"}`)
+record.FromJson(`{"name":"Zhang San","age":25}`).FromJson(`{"address":"Beijing","email":"zhangsan@example.com"}`)
 ```
 
 #### Record.ToStruct
@@ -538,7 +555,6 @@ record.FromMap(map[string]interface{}{
 
 
 #### Record.FromStruct
-
 ```go
 func (r *Record) FromStruct(src interface{}) *Record
 ```
@@ -546,10 +562,157 @@ Fill from struct.
 
 **Example:**
 ```go
-user := User{Name: "李四", Age: 30}
-info := Info{Address: "xxxxx", Email: "xxxx@xxx.com"}
+user := User{Name: "Li Si", Age: 30}
+info := Info{Address: "Beijing", Email: "lisi@example.com"}
 record := eorm.NewRecord()
 record.FromStruct(user).FromStruct(info)
+```
+
+#### Record.FromRecord
+```go
+func (r *Record) FromRecord(src *Record) *Record
+```
+Populate current Record from another Record, supports chain calls. Uses deep copy to ensure nested objects are completely copied.
+
+**Example:**
+```go
+sourceRecord := eorm.NewRecord().
+    FromJson(`{"id": 1, "name": "Zhang San", "age": 25}`)
+
+// Copy data from sourceRecord to new Record
+record := eorm.NewRecord().
+    FromRecord(sourceRecord).
+    Set("email", "zhangsan@example.com").
+    Set("active", true)
+
+fmt.Println(record.ToJson())
+// Output: {"id":1,"name":"Zhang San","age":25,"email":"zhangsan@example.com","active":true}
+```
+
+#### Record.GetRecord
+```go
+func (r *Record) GetRecord(column string) (*Record, error)
+```
+Get nested Record.
+
+**Example:**
+```go
+record := eorm.NewRecord().FromJson(`{
+    "user": {
+        "name": "Zhang San",
+        "profile": {
+            "age": 25
+        }
+    }
+}`)
+
+user, err := record.GetRecord("user")
+if err != nil {
+    // Handle error
+} else {
+    fmt.Println("Name:", user.GetString("name"))
+    profile, _ := user.GetRecord("profile")
+    fmt.Println("Age:", profile.GetInt("age"))
+}
+```
+
+#### Record.GetRecords
+```go
+func (r *Record) GetRecords(column string) ([]*Record, error)
+```
+Get nested Record array.
+
+**Example:**
+```go
+record := eorm.NewRecord().FromJson(`{
+    "users": [
+        {"name": "Zhang San", "age": 25},
+        {"name": "Li Si", "age": 30}
+    ]
+}`)
+
+users, err := record.GetRecords("users")
+if err != nil {
+    // Handle error
+} else {
+    for _, user := range users {
+        fmt.Printf("Name: %s, Age: %d\n", user.GetString("name"), user.GetInt("age"))
+    }
+}
+```
+
+#### Record.GetRecordByPath
+```go
+func (r *Record) GetRecordByPath(path string) (*Record, error)
+```
+Get nested Record by dot-separated path.
+
+**Example:**
+```go
+record := eorm.NewRecord().FromJson(`{
+    "data": {
+        "user": {
+            "profile": {
+                "name": "Zhang San",
+                "age": 25
+            }
+        }
+    }
+}`)
+
+profile, err := record.GetRecordByPath("data.user.profile")
+if err != nil {
+    // Handle error
+} else {
+    fmt.Printf("Name: %s, Age: %d\n", profile.GetString("name"), profile.GetInt("age"))
+}
+```
+
+#### Record.GetStringByPath
+```go
+func (r *Record) GetStringByPath(path string) (string, error)
+```
+Get nested string value by dot-separated path.
+
+**Example:**
+```go
+record := eorm.NewRecord().FromJson(`{
+    "user": {
+        "name": "Zhang San",
+        "contact": {
+            "email": "zhangsan@example.com",
+            "phone": "13800138000"
+        }
+    }
+}`)
+
+email, err := record.GetStringByPath("user.contact.email")
+if err != nil {
+    // Handle error
+} else {
+    fmt.Println("Email:", email)
+}
+
+// If path points to a Record, it will return JSON string
+contact, err := record.GetStringByPath("user.contact")
+if err != nil {
+    // Handle error
+} else {
+    fmt.Println("Contact:", contact)  // Output in JSON format
+}
+```
+
+#### Record.String
+```go
+func (r *Record) String() string
+```
+Implement Stringer interface, returns JSON format string.
+
+**Example:**
+```go
+record := eorm.NewRecord().Set("name", "Zhang San").Set("age", 25)
+fmt.Println(record)  // Directly output JSON format
+fmt.Printf("%v\n", record)  // Using %v will also call String() method
 ```
 
 ---
@@ -1348,3 +1511,93 @@ records, err := eorm.SqlTemplate("findByAgeRange", 18, 65, 1).Query()
 
 | SQL Placeholder | Parameter Type | Result |
 |-----------|---------|------|
+| `:name` | `map[string]interface{}` | Named parameter |
+| `?` | `[]interface{}` | Positional parameter |
+| `?` | Single simple type | Single positional parameter |
+| `?` | Variadic parameters | Multiple positional parameters |
+
+---
+
+## Utility Functions
+
+### FromRecord
+```go
+func FromRecord(record *Record) *Query
+```
+Create query from Record.
+
+### FromJson
+```go
+func FromJson(jsonStr string) *Record
+```
+Create Record from JSON.
+
+### FromMap
+```go
+func FromMap(m map[string]interface{}) *Record
+```
+Create Record from map.
+
+**Example:**
+```go
+// Commonly used for data after JSON parsing
+jsonMap := map[string]interface{}{
+    "name": "Zhang San",
+    "age": 25,
+    "email": "zhangsan@example.com",
+}
+
+record := eorm.FromMap(jsonMap)
+
+// Directly use the created record
+id, err := eorm.InsertRecord("users", record)
+```
+
+### FromRecord
+```go
+func FromRecord(src *Record) *Record
+```
+Create a new Record from another Record (deep copy). Uses deep copy to ensure nested objects are completely copied.
+
+**Example:**
+```go
+sourceRecord := eorm.NewRecord().
+    FromJson(`{"id": 1, "name": "Zhang San", "age": 25}`)
+
+// Create new Record from sourceRecord
+record := eorm.FromRecord(sourceRecord)
+
+// Modifying the new Record won't affect the original Record
+record.Set("email", "zhangsan@example.com")
+
+fmt.Println("Original:", sourceRecord.ToJson())
+fmt.Println("New record:", record.ToJson())
+// Output:
+// Original: {"id":1,"name":"Zhang San","age":25}
+// New record: {"id":1,"name":"Zhang San","age":25,"email":"zhangsan@example.com"}
+```
+
+### FromStruct
+```go
+func FromStruct(src interface{}) *Record
+```
+Create Record from struct.
+
+### ToRecord
+```go
+func ToRecord(src interface{}) *Record
+```
+Convert any type to Record.
+
+### ToStruct
+```go
+func ToStruct(r *Record, dest interface{}) error
+func (r *Record) ToStruct(dest interface{}) error
+```
+Convert Record to struct.
+
+### ToStructs
+```go
+func ToStructs(records []*Record, dest interface{}) error
+```
+Convert Record slice to struct slice.

@@ -389,11 +389,16 @@ func (r *Record) Get(column string) interface{}
 func (r *Record) GetString(column string) string
 func (r *Record) GetInt(column string) int
 func (r *Record) GetInt64(column string) int64
+func (r *Record) GetInt32(column string) int32
+func (r *Record) GetInt16(column string) int16
+func (r *Record) GetUint(column string) uint
 func (r *Record) GetFloat(column string) float64
-func (r *Record) GetBool(column string) bool
+func (r *Record) GetFloat32(column string) float32
+func (r *Record) GetBytes(column string) []byte
 func (r *Record) GetTime(column string) time.Time
+func (r *Record) GetBool(column string) bool
 
-// 简写方法
+// 简写方法（向后兼容，无错误返回）
 func (r *Record) Str(column string) string
 func (r *Record) Int(column string) int
 func (r *Record) Int64(column string) int64
@@ -434,6 +439,18 @@ func (r *Record) Keys() []string
 ```go
 keys := record.Keys()
 fmt.Println("字段列表:", keys)
+```
+
+#### Record.Columns
+```go
+func (r *Record) Columns() []string
+```
+获取所有字段名（别名方法，与 Keys 相同）。
+
+**示例：**
+```go
+columns := record.Columns()
+fmt.Println("字段列表:", columns)
 ```
 
 #### Record.Remove
@@ -486,14 +503,13 @@ fmt.Println("JSON:", jsonStr)
 ```go
 func (r *Record) FromJson(jsonStr string) *Record
 ```
-从 JSON 字符串解析。
+从 JSON 字符串解析并合并到当前 Record。
 
 **示例：**
 
 ```go
 record := eorm.NewRecord()
-record.FromJson(`{"name":"张三","age":25}`).FromJson(`{"address":"xxxxx"}`)
-
+record.FromJson(`{"name":"张三","age":25}`).FromJson(`{"address":"xxxxx","email":"xxxx@xxx.com"}`)
 ```
 
 #### Record.ToStruct
@@ -556,6 +572,155 @@ info := Info{Address: "xxxxx", Email: "xxxx@xxx.com"}
 record := eorm.NewRecord()
 record.FromStruct(user).FromStruct(info)
 
+```
+
+#### Record.FromRecord
+
+```go
+func (r *Record) FromRecord(src *Record) *Record
+```
+从另一个 Record 填充当前 Record，支持链式调用。使用浅拷贝复制数据。
+
+**示例：**
+
+```go
+sourceRecord := eorm.NewRecord().
+    FromJson(`{"id": 1, "name": "张三", "age": 25}`)
+
+// 从 sourceRecord 复制数据到新 Record
+record := eorm.NewRecord().
+    FromRecord(sourceRecord).
+    Set("email", "zhangsan@example.com").
+    Set("active", true)
+
+fmt.Println(record.ToJson())
+// 输出: {"id":1,"name":"张三","age":25,"email":"zhangsan@example.com","active":true}
+```
+
+#### Record.GetRecord
+```go
+func (r *Record) GetRecord(column string) (*Record, error)
+```
+获取嵌套的 Record。
+
+**示例：**
+```go
+record := eorm.NewRecord().FromJson(`{
+    "user": {
+        "name": "张三",
+        "profile": {
+            "age": 25
+        }
+    }
+}`)
+
+user, err := record.GetRecord("user")
+if err != nil {
+    // 处理错误
+} else {
+    fmt.Println("姓名:", user.GetString("name"))
+    profile, _ := user.GetRecord("profile")
+    fmt.Println("年龄:", profile.GetInt("age"))
+}
+```
+
+#### Record.GetRecords
+```go
+func (r *Record) GetRecords(column string) ([]*Record, error)
+```
+获取嵌套的 Record 数组。
+
+**示例：**
+```go
+record := eorm.NewRecord().FromJson(`{
+    "users": [
+        {"name": "张三", "age": 25},
+        {"name": "李四", "age": 30}
+    ]
+}`)
+
+users, err := record.GetRecords("users")
+if err != nil {
+    // 处理错误
+} else {
+    for _, user := range users {
+        fmt.Printf("姓名: %s, 年龄: %d\n", user.GetString("name"), user.GetInt("age"))
+    }
+}
+```
+
+#### Record.GetRecordByPath
+```go
+func (r *Record) GetRecordByPath(path string) (*Record, error)
+```
+通过点分路径获取嵌套 Record。
+
+**示例：**
+```go
+record := eorm.NewRecord().FromJson(`{
+    "data": {
+        "user": {
+            "profile": {
+                "name": "张三",
+                "age": 25
+            }
+        }
+    }
+}`)
+
+profile, err := record.GetRecordByPath("data.user.profile")
+if err != nil {
+    // 处理错误
+} else {
+    fmt.Printf("姓名: %s, 年龄: %d\n", profile.GetString("name"), profile.GetInt("age"))
+}
+```
+
+#### Record.GetStringByPath
+```go
+func (r *Record) GetStringByPath(path string) (string, error)
+```
+通过点分路径获取嵌套的字符串值。
+
+**示例：**
+```go
+record := eorm.NewRecord().FromJson(`{
+    "user": {
+        "name": "张三",
+        "contact": {
+            "email": "zhangsan@example.com",
+            "phone": "13800138000"
+        }
+    }
+}`)
+
+email, err := record.GetStringByPath("user.contact.email")
+if err != nil {
+    // 处理错误
+} else {
+    fmt.Println("邮箱:", email)
+}
+
+// 如果路径指向 Record，会返回 JSON 字符串
+contact, err := record.GetStringByPath("user.contact")
+if err != nil {
+    // 处理错误
+} else {
+    fmt.Println("联系方式:", contact)  // 以 JSON 格式输出
+}
+```
+
+#### Record.String
+```go
+func (r *Record) String() string
+```
+实现 Stringer 接口，返回 JSON 格式的字符串。
+
+**示例：**
+```go
+record := eorm.NewRecord().Set("name", "张三").Set("age", 25)
+fmt.Println(record)  // 直接输出 JSON 格式
+fmt.Printf("%v\n", record)  // 使用 %v 也会调用 String() 方法
 ```
 
 ---
@@ -3614,6 +3779,194 @@ user := User{
 record := eorm.ToRecord(user)
 
 // 直接使用转换后的 record
+id, err := eorm.InsertRecord("users", record)
+```
+
+#### FromRecord
+```go
+func (r *Record) FromRecord(src *Record) *Record
+```
+从另一个 Record 填充当前 Record（浅拷贝）。使用浅拷贝复制数据，嵌套对象（如 map、slice、Record）会共享引用。
+
+**特点：**
+- ✅ 性能更好：只复制引用，不需要递归复制所有嵌套对象
+- ✅ 内存占用更少：多个 Record 可以共享同一个嵌套对象
+- ⚠️ 注意：修改嵌套对象会影响原始 Record
+
+**适用场景：**
+- 只读取数据，不修改嵌套对象
+- 需要多个 Record 共享同一个配置对象
+- 临时拷贝，不需要长期独立
+- 性能敏感的场景
+
+**示例：**
+```go
+sourceRecord := eorm.NewRecord().
+    FromJson(`{"id": 1, "name": "张三", "profile": {"age": 25, "city": "北京"}}`)
+
+// 浅拷贝：共享嵌套对象的引用
+record := eorm.NewRecord().FromRecord(sourceRecord)
+
+// 修改顶层字段不会影响原始 Record
+record.Set("email", "zhangsan@example.com")
+
+// 修改嵌套对象会影响原始 Record（因为共享引用）
+if profile, _ := record.GetRecord("profile"); profile != nil {
+    profile.Set("city", "上海")  // 这会同时修改 sourceRecord 的 profile
+}
+
+fmt.Println("原始:", sourceRecord.ToJson())
+fmt.Println("新记录:", record.ToJson())
+```
+
+#### Clone
+```go
+func (r *Record) Clone() *Record
+```
+创建 Record 的浅拷贝，包括所有字段。与 FromRecord 类似，嵌套对象会共享引用。
+
+**特点：**
+- ✅ 性能更好：只复制引用
+- ✅ 内存占用更少
+- ⚠️ 注意：修改嵌套对象会影响原始 Record
+
+**适用场景：**
+- 只读取数据，不修改嵌套对象
+- 需要多个 Record 共享同一个配置对象
+- 临时拷贝，不需要长期独立
+
+**示例：**
+```go
+original := eorm.NewRecord().
+    FromJson(`{"id": 1, "name": "张三", "profile": {"age": 25, "city": "北京"}}`)
+
+// 浅拷贝
+cloned := original.Clone()
+
+// 修改顶层字段不会影响原始
+cloned.Set("name", "李四")
+
+// 修改嵌套对象会影响原始
+if profile, _ := cloned.GetRecord("profile"); profile != nil {
+    profile.Set("city", "上海")  // 这会同时修改 original 的 profile
+}
+
+fmt.Println("原始:", original.ToJson())
+fmt.Println("克隆:", cloned.ToJson())
+```
+
+#### DeepClone
+```go
+func (r *Record) DeepClone() *Record
+```
+创建 Record 的深拷贝，包括所有嵌套的对象。深拷贝会递归复制所有嵌套的 map、slice、Record 等对象，确保新 Record 与原 Record 完全独立。
+
+**特点：**
+- ✅ 完全独立：修改不会影响原始 Record
+- ✅ 更安全：避免意外的副作用
+- ⚠️ 性能相对较低：需要递归复制所有嵌套对象
+- ⚠️ 内存占用更多：为嵌套对象创建新的副本
+
+**适用场景：**
+- 需要修改嵌套对象
+- 需要长期独立的副本
+- 需要传递给其他模块或线程
+- 需要避免意外的副作用
+
+**示例：**
+```go
+original := eorm.NewRecord().
+    FromJson(`{"id": 1, "name": "张三", "profile": {"age": 25, "city": "北京"}}`)
+
+// 深拷贝：创建完全独立的副本
+cloned := original.DeepClone()
+
+// 修改任何字段都不会影响原始
+cloned.Set("name", "李四")
+if profile, _ := cloned.GetRecord("profile"); profile != nil {
+    profile.Set("city", "上海")  // 这不会影响 original 的 profile
+}
+
+fmt.Println("原始:", original.ToJson())
+fmt.Println("克隆:", cloned.ToJson())
+// 输出:
+// 原始: {"id":1,"name":"张三","profile":{"age":25,"city":"北京"}}
+// 克隆: {"id":1,"name":"李四","profile":{"age":25,"city":"上海"}}
+```
+
+#### FromRecordDeep
+```go
+func (r *Record) FromRecordDeep(src *Record) *Record
+```
+从另一个 Record 深拷贝填充当前 Record，支持链式调用。使用深拷贝复制数据，包括所有嵌套的对象，确保新 Record 与原 Record 完全独立。
+
+**特点：**
+- ✅ 完全独立：修改不会影响原始 Record
+- ✅ 支持链式调用
+- ⚠️ 性能相对较低：需要递归复制所有嵌套对象
+- ⚠️ 内存占用更多：为嵌套对象创建新的副本
+
+**适用场景：**
+- 需要修改嵌套对象
+- 需要长期独立的副本
+- 需要传递给其他模块或线程
+- 需要链式调用
+
+**示例：**
+```go
+sourceRecord := eorm.NewRecord().
+    FromJson(`{"id": 1, "name": "张三", "profile": {"age": 25, "city": "北京"}}`)
+
+// 深拷贝填充当前 Record，支持链式调用
+record := eorm.NewRecord().
+    FromRecordDeep(sourceRecord).
+    Set("email", "zhangsan@example.com")
+
+// 修改嵌套对象不会影响原始 Record
+if profile, _ := record.GetRecord("profile"); profile != nil {
+    profile.Set("city", "上海")  // 这不会影响 sourceRecord 的 profile
+}
+
+fmt.Println("原始:", sourceRecord.ToJson())
+fmt.Println("新记录:", record.ToJson())
+// 输出:
+// 原始: {"id":1,"name":"张三","profile":{"age":25,"city":"北京"}}
+// 新记录: {"id":1,"name":"张三","profile":{"age":25,"city":"上海"},"email":"zhangsan@example.com"}
+```
+
+### 浅拷贝 vs 深拷贝对比
+
+| 特性 | 浅拷贝 (Clone/FromRecord) | 深拷贝 (DeepClone/FromRecordDeep) |
+|------|---------------------------|-----------------------------------|
+| 性能 | ✅ 快 | ⚠️ 较慢 |
+| 内存占用 | ✅ 少 | ⚠️ 多 |
+| 嵌套对象 | ⚠️ 共享引用 | ✅ 完全独立 |
+| 修改影响 | ⚠️ 修改嵌套对象会影响原始 | ✅ 修改不影响原始 |
+| 适用场景 | 只读、共享引用、性能敏感 | 需要修改、需要独立、安全隔离 |
+
+**选择建议：**
+- **使用浅拷贝**：只读取数据、性能敏感、需要共享引用
+- **使用深拷贝**：需要修改嵌套对象、需要独立、需要安全隔离
+```
+
+#### FromMap
+```go
+func FromMap(m map[string]interface{}) *Record
+```
+从 map 创建新的 Record。
+
+**示例：**
+```go
+// 常用于 JSON 解析后的数据
+jsonMap := map[string]interface{}{
+    "name": "张三",
+    "age": 25,
+    "email": "zhangsan@example.com",
+}
+
+record := eorm.FromMap(jsonMap)
+
+// 直接使用创建的 record
 id, err := eorm.InsertRecord("users", record)
 ```
 

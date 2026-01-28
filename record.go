@@ -14,6 +14,26 @@ type noCopy struct{}
 
 func (*noCopy) Lock() {}
 
+// recursionTracker 用于跟踪深拷贝过程中的对象引用，防止循环引用导致无限递归
+type recursionTracker struct {
+	visited map[uintptr]interface{}
+}
+
+func newRecursionTracker() *recursionTracker {
+	return &recursionTracker{
+		visited: make(map[uintptr]interface{}),
+	}
+}
+
+func (rt *recursionTracker) add(ptr uintptr, cloned interface{}) {
+	rt.visited[ptr] = cloned
+}
+
+func (rt *recursionTracker) get(ptr uintptr) (interface{}, bool) {
+	cloned, ok := rt.visited[ptr]
+	return cloned, ok
+}
+
 // Record represents a single record in the database, similar to JFinal's ActiveRecord
 // columns 保留原始大小写用于生成 SQL，lowerKeyMap 用于大小写不敏感的快速查找
 type Record struct {
@@ -108,6 +128,19 @@ func (r *Record) getValue(column string) interface{} {
 // Get gets a column value from the Record
 func (r *Record) Get(column string) interface{} {
 	return r.getValue(column)
+}
+
+func (r *Record) MustGet(column string) (interface{}, error) {
+	if !r.Has(column) {
+		return "", fmt.Errorf("column %s not found", column)
+	}
+	return r.getValue(column), nil
+}
+func (r *Record) MustGetString(column string) (string, error) {
+	if !r.Has(column) {
+		return "", fmt.Errorf("column %s not found", column)
+	}
+	return r.GetString(column), nil
 }
 
 // GetInt gets a column value as int
@@ -369,6 +402,175 @@ func cloneValue(v interface{}) interface{} {
 	}
 }
 
+// deepCloneValue 深拷贝 interface{} 里面的值，使用 recursionTracker 防止循环引用
+func deepCloneValue(v interface{}, tracker *recursionTracker) interface{} {
+	if v == nil {
+		return nil
+	}
+
+	// 获取值的指针地址（仅对引用类型有效）
+	val := reflect.ValueOf(v)
+	var ptr uintptr
+	switch val.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Array, reflect.Chan, reflect.Func, reflect.Interface:
+		ptr = val.Pointer()
+	default:
+		ptr = 0
+	}
+
+	if ptr != 0 {
+		// 检查是否已经克隆过
+		if cloned, ok := tracker.get(ptr); ok {
+			return cloned
+		}
+	}
+
+	switch val := v.(type) {
+	case *Record:
+		// 使用 DeepClone 方法深拷贝 Record
+		cloned := val.DeepClone()
+		if ptr != 0 {
+			tracker.add(ptr, cloned)
+		}
+		return cloned
+	case []byte:
+		newByte := make([]byte, len(val))
+		copy(newByte, val)
+		return newByte
+	case map[string]interface{}:
+		newMap := make(map[string]interface{})
+		if ptr != 0 {
+			tracker.add(ptr, newMap)
+		}
+		for k2, v2 := range val {
+			newMap[k2] = deepCloneValue(v2, tracker)
+		}
+		return newMap
+	case []interface{}:
+		newSlice := make([]interface{}, len(val))
+		if ptr != 0 {
+			tracker.add(ptr, newSlice)
+		}
+		for i, v2 := range val {
+			newSlice[i] = deepCloneValue(v2, tracker)
+		}
+		return newSlice
+	default:
+		// 对于其他类型，使用反射处理
+		return deepCloneReflect(v, tracker)
+	}
+}
+
+// deepCloneReflect 使用反射深拷贝任意类型的值
+func deepCloneReflect(v interface{}, tracker *recursionTracker) interface{} {
+	if v == nil {
+		return nil
+	}
+
+	val := reflect.ValueOf(v)
+
+	// 如果是指针，获取指针指向的值
+	if val.Kind() == reflect.Ptr {
+		if val.IsNil() {
+			return nil
+		}
+		ptr := val.Pointer()
+		if cloned, ok := tracker.get(ptr); ok {
+			return cloned
+		}
+
+		// 递归克隆指针指向的值
+		elem := val.Elem()
+		clonedElem := deepCloneReflectValue(elem, tracker)
+
+		// 创建新的指针
+		clonedPtr := reflect.New(elem.Type())
+		clonedPtr.Elem().Set(clonedElem)
+		tracker.add(ptr, clonedPtr.Interface())
+		return clonedPtr.Interface()
+	}
+
+	// 非指针类型直接返回
+	return v
+}
+
+// deepCloneReflectValue 使用反射深拷贝 reflect.Value
+func deepCloneReflectValue(val reflect.Value, tracker *recursionTracker) reflect.Value {
+	if !val.IsValid() {
+		return reflect.Value{}
+	}
+
+	switch val.Kind() {
+	case reflect.Ptr:
+		if val.IsNil() {
+			return val
+		}
+		ptr := val.Pointer()
+		if cloned, ok := tracker.get(ptr); ok {
+			return reflect.ValueOf(cloned)
+		}
+		elem := val.Elem()
+		clonedElem := deepCloneReflectValue(elem, tracker)
+		clonedPtr := reflect.New(elem.Type())
+		clonedPtr.Elem().Set(clonedElem)
+		tracker.add(ptr, clonedPtr.Interface())
+		return clonedPtr
+
+	case reflect.Slice:
+		if val.IsNil() {
+			return val
+		}
+		ptr := val.Pointer()
+		if cloned, ok := tracker.get(ptr); ok {
+			return reflect.ValueOf(cloned)
+		}
+		len := val.Len()
+		newSlice := reflect.MakeSlice(val.Type(), len, len)
+		tracker.add(ptr, newSlice.Interface())
+		for i := 0; i < len; i++ {
+			newSlice.Index(i).Set(deepCloneReflectValue(val.Index(i), tracker))
+		}
+		return newSlice
+
+	case reflect.Map:
+		if val.IsNil() {
+			return val
+		}
+		ptr := val.Pointer()
+		if cloned, ok := tracker.get(ptr); ok {
+			return reflect.ValueOf(cloned)
+		}
+		newMap := reflect.MakeMap(val.Type())
+		tracker.add(ptr, newMap.Interface())
+		for _, key := range val.MapKeys() {
+			newMap.SetMapIndex(deepCloneReflectValue(key, tracker), deepCloneReflectValue(val.MapIndex(key), tracker))
+		}
+		return newMap
+
+	case reflect.Struct:
+		newStruct := reflect.New(val.Type()).Elem()
+		for i := 0; i < val.NumField(); i++ {
+			field := val.Field(i)
+			if field.CanInterface() {
+				newStruct.Field(i).Set(deepCloneReflectValue(field, tracker))
+			}
+		}
+		return newStruct
+
+	case reflect.Array:
+		len := val.Len()
+		newArray := reflect.New(val.Type()).Elem()
+		for i := 0; i < len; i++ {
+			newArray.Index(i).Set(deepCloneReflectValue(val.Index(i), tracker))
+		}
+		return newArray
+
+	default:
+		// 基本类型直接返回
+		return val
+	}
+}
+
 // UnmarshalJSON implements the json.Unmarshaler interface
 func (r *Record) UnmarshalJSON(data []byte) error {
 	r.mu.Lock()
@@ -500,6 +702,54 @@ func (r *Record) FromRecord(src *Record) *Record {
 	// 直接复制值
 	for key, value := range src.columns {
 		r.columns[key] = value
+		r.lowerKeyMap[strings.ToLower(key)] = key
+	}
+	return r
+}
+
+// DeepClone creates a deep copy of the Record
+// 创建 Record 的深拷贝，包括所有嵌套的对象
+func (r *Record) DeepClone() *Record {
+	if r == nil {
+		return nil
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	newRecord := NewRecord()
+	tracker := newRecursionTracker()
+
+	for k, v := range r.columns {
+		newRecord.setDirect(k, deepCloneValue(v, tracker))
+	}
+
+	return newRecord
+}
+
+// FromRecordDeep populates Record from another Record with deep copy
+// 从另一个 Record 深拷贝填充当前 Record，支持链式调用
+func (r *Record) FromRecordDeep(src *Record) *Record {
+	if src == nil {
+		return r
+	}
+
+	// 获取源 Record 的只读锁
+	src.mu.RLock()
+	defer src.mu.RUnlock()
+
+	// 获取目标 Record 的写锁
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// 清空现有数据
+	r.columns = make(map[string]interface{})
+	r.lowerKeyMap = make(map[string]string)
+
+	// 使用深拷贝复制值
+	tracker := newRecursionTracker()
+	for key, value := range src.columns {
+		r.columns[key] = deepCloneValue(value, tracker)
 		r.lowerKeyMap[strings.ToLower(key)] = key
 	}
 	return r

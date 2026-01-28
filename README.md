@@ -586,7 +586,7 @@ eorm.BatchDeleteByIds("users", ids)
 
 ```
 
-### 4. Record 对象详解
+### 4. Record 对象
 
 `Record` 是 eorm 的核心，它类似于一个增强版的 `map[string]interface{}`。不需要定义结构体即可操作数据库表,Record的字段名不区分大小写。
 
