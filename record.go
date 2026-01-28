@@ -2,6 +2,8 @@ package eorm
 
 import (
 	"encoding/json"
+	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +35,15 @@ func NewRecord() *Record {
 // 常用于 JSON 解析后的数据：record := eorm.FromMap(jsonMap)
 func FromMap(m map[string]interface{}) *Record {
 	return NewRecord().FromMap(m)
+}
+
+// FromRecord (函数版) 从另一个 Record 创建新 Record
+// 使用深拷贝确保嵌套对象也被完整复制
+func FromRecord(src *Record) *Record {
+	if src == nil {
+		return NewRecord()
+	}
+	return NewRecord().FromRecord(src)
 }
 
 // FromMap (方法版) 将 map 中的数据填充到当前 Record
@@ -240,6 +251,12 @@ func (r *Record) ToJson() string {
 	return string(data)
 }
 
+// String 实现 Stringer 接口，返回 JSON 格式的字符串
+// 这样可以直接使用 fmt.Printf("%v", record) 输出 JSON 格式
+func (r *Record) String() string {
+	return r.ToJson()
+}
+
 func (r *Record) MarshalJSON() ([]byte, error) {
 	if r == nil {
 		return []byte("{}"), nil
@@ -299,20 +316,23 @@ func (r *Record) toMapRecursive(visited map[uintptr]bool, depth int) map[string]
 	return result
 }
 
-// Clone creates a deep copy of the Record
+// Clone creates a copy of the Record
+// 创建 Record 的浅拷贝
 func (r *Record) Clone() *Record {
 	if r == nil {
 		return nil
 	}
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	newRecord := NewRecord()
+
+	// 直接复制字段
 	for k, v := range r.columns {
-		// 这里对 map 和 slice 进行简单的深拷贝处理
-		// 数据库返回的通常是基本类型、time.Time 或 []byte
-		newRecord.setDirect(k, cloneValue(v))
+		newRecord.setDirect(k, v)
 	}
+
 	return newRecord
 }
 
@@ -323,6 +343,9 @@ func cloneValue(v interface{}) interface{} {
 	}
 
 	switch val := v.(type) {
+	case *Record:
+		// 递归克隆嵌套的 Record
+		return val.Clone()
 	case []byte:
 		newByte := make([]byte, len(val))
 		copy(newByte, val)
@@ -370,15 +393,78 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 
 // FromJson parses JSON string into the Record
 func (r *Record) FromJson(jsonStr string) *Record {
-	tempData := make(map[string]interface{})
-	if err := json.Unmarshal([]byte(jsonStr), &tempData); err != nil {
-		return r // 静默处理错误，保持链式调用
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+		return r
 	}
-	// 使用 Set 方法合并数据
-	for k, v := range tempData {
-		r.Set(k, v)
+
+	for k, v := range data {
+		r.columns[k] = r.convertJsonValue(v)
+		r.lowerKeyMap[strings.ToLower(k)] = k
 	}
 	return r
+}
+
+// convertJsonValue 转换 JSON 值为适当类型
+func (r *Record) convertJsonValue(value interface{}) interface{} {
+	if value == nil {
+		return nil
+	}
+
+	// 处理 map
+	if m, ok := value.(map[string]interface{}); ok {
+		return r.convertJsonMap(m)
+	}
+
+	// 处理数组
+	if slice, ok := value.([]interface{}); ok {
+		return r.convertJsonArray(slice)
+	}
+
+	return value
+}
+
+// convertJsonMap 将 map 转换为 Record
+func (r *Record) convertJsonMap(m map[string]interface{}) *Record {
+	record := NewRecord()
+	for k, v := range m {
+		record.Set(k, r.convertJsonValue(v))
+	}
+	return record
+}
+
+// convertJsonArray 转换 JSON 数组
+func (r *Record) convertJsonArray(slice []interface{}) interface{} {
+	if len(slice) == 0 {
+		return slice
+	}
+
+	// 检查是否可以转换为 Record 数组
+	first := slice[0]
+	if first == nil {
+		return slice
+	}
+
+	// 如果是 map 数组，转换为 []*Record
+	if _, ok := first.(map[string]interface{}); ok {
+		records := make([]*Record, len(slice))
+		for i, item := range slice {
+			if m, ok := item.(map[string]interface{}); ok {
+				records[i] = r.convertJsonMap(m)
+			}
+		}
+		return records
+	}
+
+	// 其他类型数组，处理每个元素
+	result := make([]interface{}, len(slice))
+	for i, item := range slice {
+		result[i] = r.convertJsonValue(item)
+	}
+	return result
 }
 
 // ToStruct converts the Record to a struct
@@ -389,6 +475,33 @@ func (r *Record) ToStruct(dest interface{}) error {
 // FromStruct populates the Record from a struct
 func (r *Record) FromStruct(src interface{}) *Record {
 	_ = FromStruct(src, r)
+	return r
+}
+
+// FromRecord populates the Record from another Record
+// 支持链式调用：record.FromRecord(record1).Set("extra", value)
+func (r *Record) FromRecord(src *Record) *Record {
+	if src == nil {
+		return r
+	}
+
+	// 获取源 Record 的只读锁
+	src.mu.RLock()
+	defer src.mu.RUnlock()
+
+	// 获取目标 Record 的写锁
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// 清空现有数据
+	r.columns = make(map[string]interface{})
+	r.lowerKeyMap = make(map[string]string)
+
+	// 直接复制值
+	for key, value := range src.columns {
+		r.columns[key] = value
+		r.lowerKeyMap[strings.ToLower(key)] = key
+	}
 	return r
 }
 
@@ -445,4 +558,288 @@ func (r *Record) Bool(column string) bool {
 // Time returns the column value as time.Time
 func (r *Record) Time(column string) time.Time {
 	return r.GetTime(column)
+}
+
+// GetRecords returns a slice of Records from a column
+// 主要用途是FromJson的数据结构比较复杂,里面嵌套了其他的Record数组,
+// 所以需要通过GetRecords来获取里面的Record数组
+func (r *Record) GetRecords(column string) ([]*Record, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	val := r.getValue(column)
+	if val == nil {
+		return nil, fmt.Errorf("column '%s' not found", column)
+	}
+
+	records := convertToRecordSliceSafe(val)
+	if records == nil {
+		return nil, fmt.Errorf("column '%s' cannot be converted to []*Record", column)
+	}
+	return records, nil
+}
+
+// GetRecord returns a single Record from a column
+// 主要用途是FromJson的数据结构比较复杂,里面嵌套了其他的Record,
+// 所以需要通过GetRecord来获取里面的Record
+// 支持的类型：
+// 1. *Record - 直接返回
+// 2. Record - 返回指针
+// 3. map[string]interface{} - 转换为 Record
+func (r *Record) GetRecord(column string) (*Record, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	val := r.getValue(column)
+	if val == nil {
+		return nil, fmt.Errorf("column '%s' not found", column)
+	}
+
+	record := convertToRecord(val)
+	if record == nil {
+		return nil, fmt.Errorf("column '%s' cannot be converted to Record", column)
+	}
+	return record, nil
+}
+
+// GetRecordByPath 通过点分路径获取嵌套 Record
+// 例如："level1.level2" 会先获取 level1，再从 level1 中获取 level2
+// from json示例：
+//
+//	{
+//	    "level1": {
+//	        "level2": {
+//	            "name": "张三",
+//	            "age": 30
+//	        }
+//	    }
+//	}
+func (r *Record) GetRecordByPath(path string) (*Record, error) {
+	if path == "" {
+		return nil, fmt.Errorf("path cannot be empty")
+	}
+
+	parts := strings.Split(path, ".")
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("invalid path: %s", path)
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	current := r
+	for i, part := range parts {
+		val := current.getValue(part)
+		if val == nil {
+			return nil, fmt.Errorf("path '%s' not found at part '%s'", path, part)
+		}
+
+		if i == len(parts)-1 {
+			record := convertToRecord(val)
+			if record == nil {
+				return nil, fmt.Errorf("path '%s' cannot be converted to Record", path)
+			}
+			return record, nil
+		}
+
+		nextRecord := convertToRecord(val)
+		if nextRecord != nil {
+			current = nextRecord
+		} else {
+			return nil, fmt.Errorf("path '%s' cannot be converted to Record at part '%s'", path, part)
+		}
+	}
+
+	return nil, fmt.Errorf("path '%s' not found", path)
+}
+
+// GetStringByPath 通过点分路径获取嵌套的字符串值
+// 支持多层嵌套结构，如 "user.profile.name"
+// 返回值和错误，如果路径不存在或无法转换为字符串，返回错误
+func (r *Record) GetStringByPath(path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("path cannot be empty")
+	}
+
+	parts := strings.Split(path, ".")
+	if len(parts) == 0 {
+		return "", fmt.Errorf("invalid path: %s", path)
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	current := r
+	for i, part := range parts {
+		val := current.getValue(part)
+		if val == nil {
+			return "", fmt.Errorf("path '%s' not found at part '%s'", path, part)
+		}
+
+		if i == len(parts)-1 {
+			if record := convertToRecord(val); record != nil {
+				return record.ToJson(), nil
+			}
+			str := Convert.ToString(val)
+			return str, nil
+		}
+
+		nextRecord := convertToRecord(val)
+		if nextRecord != nil {
+			current = nextRecord
+		} else {
+			return "", fmt.Errorf("path '%s' cannot be converted to Record at part '%s'", path, part)
+		}
+	}
+
+	return "", fmt.Errorf("path '%s' not found", path)
+}
+
+func convertToRecord(value interface{}) *Record {
+	if value == nil {
+		return nil
+	}
+
+	switch v := value.(type) {
+	case *Record:
+		return v
+	case Record:
+		return &v
+	case map[string]interface{}:
+		return convertMapToRecord(v)
+	case string:
+		return convertJsonStringToRecord(v)
+	case []byte:
+		return convertJsonBytesToRecord(v)
+	default:
+		return nil
+	}
+}
+func convertJsonStringToRecord(jsonStr string) *Record {
+	if jsonStr == "" {
+		return nil
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+		return nil
+	}
+
+	record := NewRecord()
+	for k, v := range data {
+		record.Set(k, v)
+	}
+	return record
+}
+func convertJsonBytesToRecord(data []byte) *Record {
+	if len(data) == 0 {
+		return nil
+	}
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil
+	}
+
+	record := NewRecord()
+	for k, v := range m {
+		record.Set(k, v)
+	}
+	return record
+}
+
+// convertToRecordSliceSafe 安全的转换函数
+func convertToRecordSliceSafe(value interface{}) []*Record {
+	if value == nil {
+		return nil
+	}
+
+	switch v := value.(type) {
+	case []*Record:
+		// 返回副本以避免外部修改影响内部数据
+		records := make([]*Record, len(v))
+		copy(records, v)
+		return records
+
+	case []interface{}:
+		return convertInterfaceSliceToRecords(v)
+	case []map[string]interface{}:
+		return convertMapSliceToRecords(v)
+	default:
+		rv := reflect.ValueOf(value)
+		if rv.Kind() == reflect.Slice {
+			return convertSliceViaReflection(rv)
+		}
+		return nil
+	}
+}
+func convertSliceViaReflection(rv reflect.Value) []*Record {
+	length := rv.Len()
+	records := make([]*Record, 0, length)
+
+	for i := 0; i < length; i++ {
+		elem := rv.Index(i)
+		if elem.CanInterface() {
+			if record := convertToRecord(elem.Interface()); record != nil {
+				records = append(records, record)
+			}
+		}
+	}
+	return records
+}
+
+// convertInterfaceSliceToRecords 转换 []interface{}
+func convertInterfaceSliceToRecords(slice []interface{}) []*Record {
+	if slice == nil {
+		return nil
+	}
+
+	records := make([]*Record, 0, len(slice))
+	for _, item := range slice {
+		if item == nil {
+			continue
+		}
+
+		switch v := item.(type) {
+		case *Record:
+			records = append(records, v)
+		case map[string]interface{}:
+			records = append(records, convertMapToRecord(v))
+		default:
+			// 其他类型忽略
+		}
+	}
+	return records
+}
+
+// convertMapSliceToRecords 转换 []map[string]interface{}
+func convertMapSliceToRecords(maps []map[string]interface{}) []*Record {
+	records := make([]*Record, len(maps))
+	for i, m := range maps {
+		records[i] = convertMapToRecord(m)
+	}
+	return records
+}
+
+// convertMapToRecord 转换 map 为 Record
+func convertMapToRecord(m map[string]interface{}) *Record {
+	if m == nil {
+		return nil
+	}
+
+	record := NewRecord()
+	for k, v := range m {
+		record.Set(k, v)
+	}
+	return record
+}
+
+// Delete is an alias for Remove
+func (r *Record) Delete(column string) {
+	r.Remove(column)
+}
+
+// Columns is an alias for Keys
+func (r *Record) Columns() []string {
+	return r.Keys()
 }
