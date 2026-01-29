@@ -300,17 +300,9 @@ func (r *Record) ToMap() map[string]interface{} {
 }
 
 // ToJson converts the Record to JSON string
+// ToJson converts the Record to JSON string with insertion order preserved
 func (r *Record) ToJson() string {
 	data, err := r.MarshalJSON()
-	if err != nil {
-		return "{}"
-	}
-	return string(data)
-}
-
-// ToOrderedJson converts the Record to JSON string with insertion order preserved
-func (r *Record) ToOrderedJson() string {
-	data, err := r.MarshalOrderedJSON()
 	if err != nil {
 		return "{}"
 	}
@@ -323,21 +315,8 @@ func (r *Record) String() string {
 	return r.ToJson()
 }
 
+// MarshalJSON 实现 json.Marshaler 接口，使 json.Marshal 也能保持顺序
 func (r *Record) MarshalJSON() ([]byte, error) {
-	if r == nil {
-		return []byte("{}"), nil
-	}
-
-	// 使用递归转换
-	data, err := json.Marshal(r.toMapRecursive(make(map[uintptr]bool), 0))
-	if err != nil {
-		return []byte("{}"), err
-	}
-	return data, nil
-}
-
-// MarshalOrderedJSON 序列化 Record 为 JSON 字节数组，保持插入顺序（优化版）
-func (r *Record) MarshalOrderedJSON() ([]byte, error) {
 	if r == nil {
 		return []byte("{}"), nil
 	}
@@ -418,6 +397,40 @@ func (r *Record) marshalOrderedJSONOptimized(visited map[uintptr]bool, depth int
 				}
 			case nil:
 				buf.WriteString("null")
+			case []interface{}:
+				// 手动序列化数组，确保数组中的 Record 也能保持顺序
+				buf.WriteByte('[')
+				for i, item := range val {
+					if i > 0 {
+						buf.WriteByte(',')
+					}
+					switch itemVal := item.(type) {
+					case *Record:
+						if itemVal != nil {
+							nestedJSON, err := itemVal.marshalOrderedJSONOptimized(visited, depth+1)
+							if err != nil {
+								return nil, err
+							}
+							buf.Write(nestedJSON)
+						} else {
+							buf.WriteString("null")
+						}
+					case Record:
+						nestedJSON, err := (&itemVal).marshalOrderedJSONOptimized(visited, depth+1)
+						if err != nil {
+							return nil, err
+						}
+						buf.Write(nestedJSON)
+					default:
+						// 其他类型使用标准库序列化
+						itemJSON, err := json.Marshal(item)
+						if err != nil {
+							return nil, err
+						}
+						buf.Write(itemJSON)
+					}
+				}
+				buf.WriteByte(']')
 			default:
 				// 使用标准库序列化其他类型
 				valJSON, err := json.Marshal(v)
