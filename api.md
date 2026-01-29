@@ -710,17 +710,116 @@ if err != nil {
 }
 ```
 
-#### Record.String
+
+
+#### Record.GetSlice
 ```go
-func (r *Record) String() string
+func (r *Record) GetSlice(column string) ([]interface{}, error)
 ```
-实现 Stringer 接口，返回 JSON 格式的字符串。
+获取切片值，返回 []interface{}。
 
 **示例：**
 ```go
-record := eorm.NewRecord().Set("name", "张三").Set("age", 25)
-fmt.Println(record)  // 直接输出 JSON 格式
-fmt.Printf("%v\n", record)  // 使用 %v 也会调用 String() 方法
+record := eorm.NewRecord().FromJson(`{
+    "hobbies": ["读书", "游泳", "旅游"],
+    "scores": [85, 90, 95]
+}`)
+
+hobbies, err := record.GetSlice("hobbies")
+if err != nil {
+    // 处理错误
+} else {
+    fmt.Println("爱好:", hobbies)
+}
+```
+
+#### Record.GetStringSlice
+```go
+func (r *Record) GetStringSlice(column string) ([]string, error)
+```
+获取字符串切片，自动转换为 []string。
+
+**示例：**
+```go
+record := eorm.NewRecord().FromJson(`{
+    "tags": ["developer", "golang", "database"],
+    "hobbies": ["读书", "游泳", "旅游"]
+}`)
+
+tags, err := record.GetStringSlice("tags")
+if err != nil {
+    // 处理错误
+} else {
+    for i, tag := range tags {
+        fmt.Printf("[%d] %s\n", i, tag)
+    }
+}
+
+// 字符串自动分割功能
+record2 := eorm.NewRecord()
+record2.Set("comma_separated", "apple,banana,orange")
+commaSlice, _ := record2.GetStringSlice("comma_separated")
+fmt.Println("逗号分隔:", commaSlice)  // ["apple", "banana", "orange"]
+```
+
+#### Record.GetIntSlice
+```go
+func (r *Record) GetIntSlice(column string) ([]int, error)
+```
+获取整数切片，自动转换为 []int。
+
+**示例：**
+```go
+record := eorm.NewRecord().FromJson(`{
+    "scores": [85, 90, 95],
+    "ages": [25, 30, 35]
+}`)
+
+scores, err := record.GetIntSlice("scores")
+if err != nil {
+    // 处理错误
+} else {
+    for i, score := range scores {
+        fmt.Printf("[%d] %d\n", i, score)
+    }
+    // 计算平均分
+    total := 0
+    for _, score := range scores {
+        total += score
+    }
+    average := float64(total) / float64(len(scores))
+    fmt.Printf("总分: %d, 平均分: %.2f\n", total, average)
+}
+```
+
+#### Record.GetSliceByPath
+```go
+func (r *Record) GetSliceByPath(path string) ([]interface{}, error)
+```
+通过点分路径获取嵌套的切片。
+
+**示例：**
+```go
+record := eorm.NewRecord().FromJson(`{
+    "contact": {
+        "phones": ["13800138000", "13900139000"],
+        "emails": ["zhangsan@example.com", "zhangsan@work.com"]
+    }
+}`)
+
+phones, err := record.GetSliceByPath("contact.phones")
+if err != nil {
+    // 处理错误
+} else {
+    fmt.Println("电话:", phones)
+}
+
+emails, err := record.GetSliceByPath("contact.emails")
+if err != nil {
+    // 处理错误
+} else {
+    fmt.Println("邮箱:", emails)
+}
 ```
 
 ---
@@ -3950,7 +4049,7 @@ fmt.Println("新记录:", record.ToJson())
 ```
 
 #### FromMap
-```go
+​```go
 func FromMap(m map[string]interface{}) *Record
 ```
 从 map 创建新的 Record。

@@ -829,6 +829,92 @@ func (r *Record) GetRecords(column string) ([]*Record, error) {
 	return records, nil
 }
 
+// GetSlice 获取切片值，返回 []interface{} 和 error
+func (r *Record) GetSlice(column string) ([]interface{}, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	val := r.getValue(column)
+	if val == nil {
+		return nil, fmt.Errorf("column '%s' not found", column)
+	}
+
+	slice := toInterfaceSlice(val)
+	if slice == nil {
+		return nil, fmt.Errorf("column '%s' cannot be converted to slice", column)
+	}
+
+	return slice, nil
+}
+
+// GetStringSlice 获取字符串切片
+func (r *Record) GetStringSlice(column string) ([]string, error) {
+	slice, err := r.GetSlice(column)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]string, len(slice))
+	for i, v := range slice {
+		result[i] = Convert.ToString(v)
+	}
+	return result, nil
+}
+
+// GetIntSlice 获取整数切片
+func (r *Record) GetIntSlice(column string) ([]int, error) {
+	slice, err := r.GetSlice(column)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]int, len(slice))
+	for i, v := range slice {
+		result[i] = Convert.ToInt(v)
+	}
+	return result, nil
+}
+
+// GetSliceByPath 通过路径获取切片
+func (r *Record) GetSliceByPath(path string) ([]interface{}, error) {
+	if path == "" {
+		return nil, fmt.Errorf("path cannot be empty")
+	}
+
+	parts := strings.Split(path, ".")
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("invalid path: %s", path)
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	current := r
+	for i, part := range parts {
+		val := current.getValue(part)
+		if val == nil {
+			return nil, fmt.Errorf("path '%s' not found at part '%s'", path, part)
+		}
+
+		if i == len(parts)-1 {
+			slice := toInterfaceSlice(val)
+			if slice == nil {
+				return nil, fmt.Errorf("path '%s' cannot be converted to slice", path)
+			}
+			return slice, nil
+		}
+
+		nextRecord := convertToRecord(val)
+		if nextRecord != nil {
+			current = nextRecord
+		} else {
+			return nil, fmt.Errorf("path '%s' cannot be converted to Record at part '%s'", path, part)
+		}
+	}
+
+	return nil, fmt.Errorf("path '%s' not found", path)
+}
+
 // GetRecord returns a single Record from a column
 // 主要用途是FromJson的数据结构比较复杂,里面嵌套了其他的Record,
 // 所以需要通过GetRecord来获取里面的Record
@@ -1092,4 +1178,77 @@ func (r *Record) Delete(column string) {
 // Columns is an alias for Keys
 func (r *Record) Columns() []string {
 	return r.Keys()
+}
+
+// toInterfaceSlice 核心转换函数
+func toInterfaceSlice(value interface{}) []interface{} {
+	if value == nil {
+		return nil
+	}
+
+	// 如果是 []interface{} 直接返回
+	if slice, ok := value.([]interface{}); ok {
+		return slice
+	}
+
+	// 通过反射处理
+	rv := reflect.ValueOf(value)
+	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+		// 如果不是切片/数组，尝试分割字符串或包装为单元素切片
+		return wrapAsSlice(value)
+	}
+
+	// 处理切片/数组
+	length := rv.Len()
+	result := make([]interface{}, length)
+	for i := 0; i < length; i++ {
+		elem := rv.Index(i)
+		if elem.CanInterface() {
+			result[i] = elem.Interface()
+		}
+	}
+	return result
+}
+
+// wrapAsSlice 将值包装为切片
+func wrapAsSlice(value interface{}) []interface{} {
+	if value == nil {
+		return nil
+	}
+
+	// 如果是字符串，尝试分割
+	if str, ok := value.(string); ok {
+		return splitString(str)
+	}
+
+	// 如果是 []byte，转换为字符串再处理
+	if bytes, ok := value.([]byte); ok {
+		return splitString(string(bytes))
+	}
+
+	// 其他类型包装为单元素切片
+	return []interface{}{value}
+}
+
+// splitString 分割字符串
+func splitString(str string) []interface{} {
+	if str == "" {
+		return nil
+	}
+
+	// 检查常见分隔符
+	delimiters := []string{",", ";", "|", " "}
+	for _, delim := range delimiters {
+		if strings.Contains(str, delim) {
+			parts := strings.Split(str, delim)
+			result := make([]interface{}, len(parts))
+			for i, part := range parts {
+				result[i] = strings.TrimSpace(part)
+			}
+			return result
+		}
+	}
+
+	// 没有分隔符，作为单元素切片
+	return []interface{}{str}
 }
