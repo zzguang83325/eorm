@@ -1,6 +1,7 @@
 package eorm
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -36,9 +37,11 @@ func (rt *recursionTracker) get(ptr uintptr) (interface{}, bool) {
 
 // Record represents a single record in the database, similar to JFinal's ActiveRecord
 // columns 保留原始大小写用于生成 SQL，lowerKeyMap 用于大小写不敏感的快速查找
+// keys 保存字段插入顺序，用于 JSON 输出时保持顺序
 type Record struct {
 	columns     map[string]interface{} // 原始键名 -> 值
 	lowerKeyMap map[string]string      // 小写键名 -> 原始键名（用于快速查找）
+	keys        []string               // 保存字段插入顺序
 	noCopy      noCopy
 	mu          sync.RWMutex
 }
@@ -48,6 +51,7 @@ func NewRecord() *Record {
 	return &Record{
 		columns:     make(map[string]interface{}),
 		lowerKeyMap: make(map[string]string),
+		keys:        make([]string, 0),
 	}
 }
 
@@ -97,6 +101,8 @@ func (r *Record) Set(column string, value interface{}) *Record {
 	// 新字段：保存原始大小写和映射关系
 	r.columns[column] = value
 	r.lowerKeyMap[lowerKey] = column
+	// 添加到 keys 列表以保持插入顺序
+	r.keys = append(r.keys, column)
 	return r
 }
 
@@ -110,6 +116,8 @@ func (r *Record) setDirect(column string, value interface{}) {
 	lowerKey := strings.ToLower(column)
 	r.columns[column] = value
 	r.lowerKeyMap[lowerKey] = column
+	// 添加到 keys 列表以保持插入顺序
+	r.keys = append(r.keys, column)
 }
 
 // getValue gets a column value from the Record with case-insensitive support
@@ -231,15 +239,23 @@ func (r *Record) Has(column string) bool {
 	return exists
 }
 
-// Keys returns all column names
+// ValidateRequired 验证必填字段
+func (r *Record) ValidateRequired(columns ...string) error {
+	for _, col := range columns {
+		if !r.Has(col) {
+			return fmt.Errorf("field '%s' is required", col)
+		}
+	}
+	return nil
+}
+
+// Keys returns all column names in insertion order
 func (r *Record) Keys() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	keys := make([]string, 0, len(r.columns))
-	for k := range r.columns {
-		keys = append(keys, k)
-	}
+	keys := make([]string, len(r.keys))
+	copy(keys, r.keys)
 	return keys
 }
 
@@ -252,6 +268,13 @@ func (r *Record) Remove(column string) {
 	if actualKey, exists := r.lowerKeyMap[lowerKey]; exists {
 		delete(r.columns, actualKey)
 		delete(r.lowerKeyMap, lowerKey)
+		// 从 keys 列表中移除
+		for i, k := range r.keys {
+			if k == actualKey {
+				r.keys = append(r.keys[:i], r.keys[i+1:]...)
+				break
+			}
+		}
 	}
 }
 
@@ -261,6 +284,7 @@ func (r *Record) Clear() {
 	defer r.mu.Unlock()
 	r.columns = make(map[string]interface{})
 	r.lowerKeyMap = make(map[string]string)
+	r.keys = make([]string, 0)
 }
 
 // ToMap converts the Record to a map (returns a copy)
@@ -284,6 +308,15 @@ func (r *Record) ToJson() string {
 	return string(data)
 }
 
+// ToOrderedJson converts the Record to JSON string with insertion order preserved
+func (r *Record) ToOrderedJson() string {
+	data, err := r.MarshalOrderedJSON()
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
 // String 实现 Stringer 接口，返回 JSON 格式的字符串
 // 这样可以直接使用 fmt.Printf("%v", record) 输出 JSON 格式
 func (r *Record) String() string {
@@ -301,6 +334,133 @@ func (r *Record) MarshalJSON() ([]byte, error) {
 		return []byte("{}"), err
 	}
 	return data, nil
+}
+
+// MarshalOrderedJSON 序列化 Record 为 JSON 字节数组，保持插入顺序（优化版）
+func (r *Record) MarshalOrderedJSON() ([]byte, error) {
+	if r == nil {
+		return []byte("{}"), nil
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.marshalOrderedJSONOptimized(make(map[uintptr]bool), 0)
+}
+
+// marshalOrderedJSONOptimized 优化版本，性能更好
+func (r *Record) marshalOrderedJSONOptimized(visited map[uintptr]bool, depth int) ([]byte, error) {
+	const maxDepth = 100
+	if depth > maxDepth {
+		return []byte(`{"__error":"max recursion depth exceeded"}`), nil
+	}
+
+	if r == nil {
+		return []byte("null"), nil
+	}
+
+	// 循环引用检测
+	currentPtr := uintptr(unsafe.Pointer(r))
+	if visited[currentPtr] {
+		return []byte(`{"__error":"circular reference"}`), nil
+	}
+	visited[currentPtr] = true
+	defer delete(visited, currentPtr)
+
+	if len(r.columns) == 0 {
+		return []byte("{}"), nil
+	}
+
+	// 使用 bytes.Buffer 比 strings.Builder 稍快
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+
+	for i, k := range r.keys {
+		if v, ok := r.columns[k]; ok {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+
+			// 写入键
+			if keyJSON, err := json.Marshal(k); err == nil {
+				buf.Write(keyJSON)
+				buf.WriteByte(':')
+			}
+
+			// 写入值
+			switch val := v.(type) {
+			case *Record:
+				if val != nil {
+					nestedJSON, err := val.marshalOrderedJSONOptimized(visited, depth+1)
+					if err != nil {
+						return nil, err
+					}
+					buf.Write(nestedJSON)
+				} else {
+					buf.WriteString("null")
+				}
+			case Record:
+				nestedJSON, err := (&val).marshalOrderedJSONOptimized(visited, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				buf.Write(nestedJSON)
+			case string:
+				// 字符串特殊处理，避免调用 json.Marshal
+				buf.WriteByte('"')
+				writeJSONString(&buf, val)
+				buf.WriteByte('"')
+			case bool:
+				if val {
+					buf.WriteString("true")
+				} else {
+					buf.WriteString("false")
+				}
+			case nil:
+				buf.WriteString("null")
+			default:
+				// 使用标准库序列化其他类型
+				valJSON, err := json.Marshal(v)
+				if err != nil {
+					return nil, err
+				}
+				buf.Write(valJSON)
+			}
+		}
+	}
+
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
+// writeJSONString 优化字符串转义
+func writeJSONString(buf *bytes.Buffer, s string) {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '"':
+			buf.WriteString(`\"`)
+		case '\\':
+			buf.WriteString(`\\`)
+		case '\b':
+			buf.WriteString(`\b`)
+		case '\f':
+			buf.WriteString(`\f`)
+		case '\n':
+			buf.WriteString(`\n`)
+		case '\r':
+			buf.WriteString(`\r`)
+		case '\t':
+			buf.WriteString(`\t`)
+		default:
+			if c < 0x20 {
+				// 控制字符
+				buf.WriteString(fmt.Sprintf("\\u%04x", c))
+			} else {
+				buf.WriteByte(c)
+			}
+		}
+	}
 }
 
 func (r *Record) toMapRecursive(visited map[uintptr]bool, depth int) map[string]interface{} {
@@ -330,19 +490,22 @@ func (r *Record) toMapRecursive(visited map[uintptr]bool, depth int) map[string]
 	}
 
 	result := make(map[string]interface{}, len(r.columns))
-	for k, v := range r.columns {
-		// 处理嵌套 Record
-		switch val := v.(type) {
-		case *Record:
-			if val != nil {
-				result[k] = val.toMapRecursive(visited, depth+1)
-			} else {
-				result[k] = nil
+	// 按照 keys 列表的顺序遍历，保持插入顺序
+	for _, k := range r.keys {
+		if v, ok := r.columns[k]; ok {
+			// 处理嵌套 Record
+			switch val := v.(type) {
+			case *Record:
+				if val != nil {
+					result[k] = val.toMapRecursive(visited, depth+1)
+				} else {
+					result[k] = nil
+				}
+			case Record:
+				result[k] = (&val).toMapRecursive(visited, depth+1)
+			default:
+				result[k] = v
 			}
-		case Record:
-			result[k] = (&val).toMapRecursive(visited, depth+1)
-		default:
-			result[k] = v
 		}
 	}
 
@@ -365,6 +528,9 @@ func (r *Record) Clone() *Record {
 	for k, v := range r.columns {
 		newRecord.setDirect(k, v)
 	}
+	// 复制 keys 顺序
+	newRecord.keys = make([]string, len(r.keys))
+	copy(newRecord.keys, r.keys)
 
 	return newRecord
 }
@@ -579,15 +745,17 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 	// 清空现有数据
 	r.columns = make(map[string]interface{})
 	r.lowerKeyMap = make(map[string]string)
+	r.keys = make([]string, 0)
 
 	// 反序列化
 	if err := json.Unmarshal(data, &r.columns); err != nil {
 		return err
 	}
 
-	// 重建小写映射
+	// 重建小写映射和 keys 顺序
 	for k := range r.columns {
 		r.lowerKeyMap[strings.ToLower(k)] = k
+		r.keys = append(r.keys, k)
 	}
 
 	return nil
@@ -603,9 +771,15 @@ func (r *Record) FromJson(jsonStr string) *Record {
 		return r
 	}
 
+	// 清空现有数据
+	r.columns = make(map[string]interface{})
+	r.lowerKeyMap = make(map[string]string)
+	r.keys = make([]string, 0)
+
 	for k, v := range data {
 		r.columns[k] = r.convertJsonValue(v)
 		r.lowerKeyMap[strings.ToLower(k)] = k
+		r.keys = append(r.keys, k)
 	}
 	return r
 }
@@ -698,12 +872,17 @@ func (r *Record) FromRecord(src *Record) *Record {
 	// 清空现有数据
 	r.columns = make(map[string]interface{})
 	r.lowerKeyMap = make(map[string]string)
+	r.keys = make([]string, 0)
 
 	// 直接复制值
 	for key, value := range src.columns {
 		r.columns[key] = value
 		r.lowerKeyMap[strings.ToLower(key)] = key
 	}
+	// 复制 keys 顺序
+	r.keys = make([]string, len(src.keys))
+	copy(r.keys, src.keys)
+
 	return r
 }
 
@@ -723,6 +902,9 @@ func (r *Record) DeepClone() *Record {
 	for k, v := range r.columns {
 		newRecord.setDirect(k, deepCloneValue(v, tracker))
 	}
+	// 复制 keys 顺序
+	newRecord.keys = make([]string, len(r.keys))
+	copy(newRecord.keys, r.keys)
 
 	return newRecord
 }
@@ -745,6 +927,7 @@ func (r *Record) FromRecordDeep(src *Record) *Record {
 	// 清空现有数据
 	r.columns = make(map[string]interface{})
 	r.lowerKeyMap = make(map[string]string)
+	r.keys = make([]string, 0)
 
 	// 使用深拷贝复制值
 	tracker := newRecursionTracker()
@@ -752,6 +935,10 @@ func (r *Record) FromRecordDeep(src *Record) *Record {
 		r.columns[key] = deepCloneValue(value, tracker)
 		r.lowerKeyMap[strings.ToLower(key)] = key
 	}
+	// 复制 keys 顺序
+	r.keys = make([]string, len(src.keys))
+	copy(r.keys, src.keys)
+
 	return r
 }
 
@@ -1251,4 +1438,10 @@ func splitString(str string) []interface{} {
 
 	// 没有分隔符，作为单元素切片
 	return []interface{}{str}
+}
+
+func (r *Record) IsEmpty() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.columns) == 0
 }
