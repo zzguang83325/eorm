@@ -39,19 +39,50 @@ func (rt *recursionTracker) get(ptr uintptr) (interface{}, bool) {
 // columns 保留原始大小写用于生成 SQL，lowerKeyMap 用于大小写不敏感的快速查找
 // keys 保存字段插入顺序，用于 JSON 输出时保持顺序
 type Record struct {
+	mu          sync.RWMutex           // 将互斥锁放在最前面，确保正确的内存对齐
 	columns     map[string]interface{} // 原始键名 -> 值
 	lowerKeyMap map[string]string      // 小写键名 -> 原始键名（用于快速查找）
 	keys        []string               // 保存字段插入顺序
-	noCopy      noCopy
-	mu          sync.RWMutex
+	noCopy      noCopy                 // 辅助工具，防止 Record 被按值拷贝
 }
 
 // NewRecord creates a new empty Record
 func NewRecord() *Record {
 	return &Record{
-		columns:     make(map[string]interface{}),
-		lowerKeyMap: make(map[string]string),
-		keys:        make([]string, 0),
+		columns:     make(map[string]interface{}, 8),
+		lowerKeyMap: make(map[string]string, 8),
+		keys:        make([]string, 0, 8),
+	}
+}
+
+var recordPool = sync.Pool{
+	New: func() interface{} {
+		return &Record{
+			columns:     make(map[string]interface{}, 16),
+			lowerKeyMap: make(map[string]string, 16),
+			keys:        make([]string, 0, 16),
+		}
+	},
+}
+
+// NewRecordFromPool 从对象池获取 Record
+// 优势：减少 GC 压力和内存分配开销
+// 规范：
+// 1. 获取后必须确保在不再使用时调用 Release() 归还，否则无法达到复用效果（虽然不会内存泄漏，但会失去优化意义）。
+// 2. 严禁在调用 Release() 后继续使用该对象，否则会导致严重的数据竞争和不可预知的行为。
+// 3. 支持在循环中连续调用以获取多个独立实例，只需确保每个实例最终都调用了 Release()。
+func NewRecordFromPool() *Record {
+	r := recordPool.Get().(*Record)
+	r.Clear()
+	return r
+}
+
+// Release 将 Record 归还到对象池
+// 警告：归还后请立即将原引用置为 nil，防止误用。
+func (r *Record) Release() {
+	if r != nil {
+		r.Clear()
+		recordPool.Put(r)
 	}
 }
 
@@ -81,15 +112,90 @@ func (r *Record) FromMap(m map[string]interface{}) *Record {
 
 // Set sets a column value in the Record with case-insensitive support for existing columns
 // 保留原始大小写用于 SQL 生成，同时维护小写映射用于快速查找
-// 自动解引用指针类型，存储实际值（nil 指针除外）
+// 自动解引用基础数据类型的指针（如 *int, *string, *time.Time 等）
+// 对于 Record 指针和复杂集合指针（*map, *slice），会自动克隆以防止意外的共享引用
 func (r *Record) Set(column string, value interface{}) *Record {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// 使用 derefPointer 函数自动解引用指针类型
-	// derefPointer 会处理 nil 指针和多层指针的情况
-	value = derefPointer(value)
+	// 自动处理指针类型，防止意外的共享引用
+	if value != nil {
+		// 优先处理最常用的基础类型
+		if isBasicType(value) {
+			// 已经是基础类型，直接使用
+		} else if isBasicPointer(value) {
+			// 基础类型指针：自动解引用为值存储
+			value = derefPointer(value)
+		} else {
+			switch v := value.(type) {
+			case *Record:
+				// Record 指针：克隆一份副本存储
+				value = v.Clone()
+			case *[]*Record:
+				// 常见的 Record 切片指针：手动遍历克隆，避免反射
+				if v != nil {
+					newSlice := make([]*Record, len(*v))
+					for i, item := range *v {
+						if item != nil {
+							newSlice[i] = item.Clone()
+						}
+					}
+					value = newSlice
+				} else {
+					value = nil
+				}
+			case *map[string]interface{}:
+				// 常见的 Map 指针：手动遍历克隆内容
+				if v != nil {
+					newMap := make(map[string]interface{}, len(*v))
+					for k, item := range *v {
+						newMap[k] = cloneValue(item)
+					}
+					value = newMap
+				} else {
+					value = nil
+				}
+			case *[]interface{}:
+				// 通用切片指针
+				if v != nil {
+					newSlice := make([]interface{}, len(*v))
+					for i, item := range *v {
+						newSlice[i] = cloneValue(item)
+					}
+					value = newSlice
+				} else {
+					value = nil
+				}
+			case *[]Record:
+				// Record 结构体切片指针
+				if v != nil {
+					newSlice := make([]Record, len(*v))
+					for i, item := range *v {
+						// Record 结构体在赋值给 interface{} 时会自动处理
+						// 这里调用其 Clone 方法确保深度隔离
+						cloned := item.Clone()
+						if cloned != nil {
+							newSlice[i] = *cloned
+						}
+					}
+					value = newSlice
+				} else {
+					value = nil
+				}
+			default:
+				// 对于其他不常用的复合指针类型，仍使用反射作为兜底
+				rv := reflect.ValueOf(value)
+				if rv.Kind() == reflect.Ptr && !rv.IsNil() {
+					elem := rv.Elem()
+					if elem.Kind() == reflect.Slice || elem.Kind() == reflect.Map {
+						value = cloneValue(elem.Interface())
+					}
+				}
+			}
+		}
+	}
 
+	// 维护小写映射用于快速查找
 	lowerKey := strings.ToLower(column)
 
 	// 如果已存在相同小写键名的字段，更新原有字段
@@ -103,6 +209,46 @@ func (r *Record) Set(column string, value interface{}) *Record {
 	r.lowerKeyMap[lowerKey] = column
 	// 添加到 keys 列表以保持插入顺序
 	r.keys = append(r.keys, column)
+	return r
+}
+
+// SetIf 只有当 condition 为 true 时才设置字段
+func (r *Record) SetIf(condition bool, column string, value interface{}) *Record {
+	if condition {
+		return r.Set(column, value)
+	}
+	return r
+}
+
+// SetIfNotNil 只有当 value 不为 nil 时才设置字段
+func (r *Record) SetIfNotNil(column string, value interface{}) *Record {
+	if !isNil(value) {
+		return r.Set(column, value)
+	}
+	return r
+}
+
+// SetIfNotEmpty 只有当 value 不为空字符串时才设置字段
+func (r *Record) SetIfNotEmpty(column, value string) *Record {
+	if value != "" {
+		return r.Set(column, value)
+	}
+	return r
+}
+
+// SetIfNil 只有当字段当前不存在或值为 nil 时才设置字段
+func (r *Record) SetIfNil(column string, value interface{}) *Record {
+	if r.Get(column) == nil {
+		return r.Set(column, value)
+	}
+	return r
+}
+
+// SetIfEmpty 只有当字段当前不存在或值为空字符串时才设置字段
+func (r *Record) SetIfEmpty(column string, value string) *Record {
+	if r.GetString(column) == "" {
+		return r.Set(column, value)
+	}
 	return r
 }
 
@@ -136,6 +282,45 @@ func (r *Record) getValue(column string) interface{} {
 // Get gets a column value from the Record
 func (r *Record) Get(column string) interface{} {
 	return r.getValue(column)
+}
+
+// GetValues 批量获取多个字段的值
+func (r *Record) GetValues(columns ...string) []interface{} {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	result := make([]interface{}, len(columns))
+	for i, col := range columns {
+		lowerKey := strings.ToLower(col)
+		if actualKey, exists := r.lowerKeyMap[lowerKey]; exists {
+			result[i] = r.columns[actualKey]
+		} else {
+			result[i] = nil
+		}
+	}
+	return result
+}
+
+// Transform 批量转换数据
+func (r *Record) Transform(fn func(key string, value interface{}) interface{}) *Record {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for k, v := range r.columns {
+		r.columns[k] = fn(k, v)
+	}
+	return r
+}
+
+// TransformValues 只转换值
+func (r *Record) TransformValues(fn func(value interface{}) interface{}) *Record {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for k, v := range r.columns {
+		r.columns[k] = fn(v)
+	}
+	return r
 }
 
 func (r *Record) MustGet(column string) (interface{}, error) {
@@ -282,9 +467,15 @@ func (r *Record) Remove(column string) {
 func (r *Record) Clear() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.columns = make(map[string]interface{})
-	r.lowerKeyMap = make(map[string]string)
-	r.keys = make([]string, 0)
+
+	// 重用已有的 map 和 slice 以减少分配，而不是重新 make
+	for k := range r.columns {
+		delete(r.columns, k)
+	}
+	for k := range r.lowerKeyMap {
+		delete(r.lowerKeyMap, k)
+	}
+	r.keys = r.keys[:0]
 }
 
 // ToMap converts the Record to a map (returns a copy)
@@ -315,6 +506,12 @@ func (r *Record) String() string {
 	return r.ToJson()
 }
 
+var jsonBufferPool = sync.Pool{
+	New: func() interface{} {
+		return &bytes.Buffer{}
+	},
+}
+
 // MarshalJSON 实现 json.Marshaler 接口，使 json.Marshal 也能保持顺序
 func (r *Record) MarshalJSON() ([]byte, error) {
 	if r == nil {
@@ -324,34 +521,64 @@ func (r *Record) MarshalJSON() ([]byte, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	return r.marshalOrderedJSONOptimized(make(map[uintptr]bool), 0)
+	buf := jsonBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer jsonBufferPool.Put(buf)
+
+	if err := r.marshalToBuffer(buf, make(map[uintptr]bool), 0); err != nil {
+		return nil, err
+	}
+
+	// 更高效的拷贝：直接返回底层数组的切片副本
+	// 这仍然是安全的，因为我们创建了一个新的切片，而原 buffer 会被归还和重置
+	data := buf.Bytes()
+	result := make([]byte, len(data))
+	copy(result, data)
+	return result, nil
 }
 
-// marshalOrderedJSONOptimized 优化版本，性能更好
-func (r *Record) marshalOrderedJSONOptimized(visited map[uintptr]bool, depth int) ([]byte, error) {
+// ToIndentedJson 格式化 JSON
+func (r *Record) ToIndentedJson() string {
+	data, err := r.MarshalJSON()
+	if err != nil {
+		return "{}"
+	}
+
+	var out bytes.Buffer
+	if err := json.Indent(&out, data, "", "  "); err != nil {
+		return string(data)
+	}
+
+	return out.String()
+}
+
+// marshalToBuffer 优化版本，支持缓冲区传递，性能更好
+func (r *Record) marshalToBuffer(buf *bytes.Buffer, visited map[uintptr]bool, depth int) error {
 	const maxDepth = 100
 	if depth > maxDepth {
-		return []byte(`{"__error":"max recursion depth exceeded"}`), nil
+		buf.WriteString(`{"__error":"max recursion depth exceeded"}`)
+		return nil
 	}
 
 	if r == nil {
-		return []byte("null"), nil
+		buf.WriteString("null")
+		return nil
 	}
 
 	// 循环引用检测
 	currentPtr := uintptr(unsafe.Pointer(r))
 	if visited[currentPtr] {
-		return []byte(`{"__error":"circular reference"}`), nil
+		buf.WriteString(`{"__error":"circular reference"}`)
+		return nil
 	}
 	visited[currentPtr] = true
 	defer delete(visited, currentPtr)
 
 	if len(r.columns) == 0 {
-		return []byte("{}"), nil
+		buf.WriteString("{}")
+		return nil
 	}
 
-	// 使用 bytes.Buffer 比 strings.Builder 稍快
-	var buf bytes.Buffer
 	buf.WriteByte('{')
 
 	for i, k := range r.keys {
@@ -360,34 +587,28 @@ func (r *Record) marshalOrderedJSONOptimized(visited map[uintptr]bool, depth int
 				buf.WriteByte(',')
 			}
 
-			// 写入键
-			if keyJSON, err := json.Marshal(k); err == nil {
-				buf.Write(keyJSON)
-				buf.WriteByte(':')
-			}
+			// 写入键：使用自定义的高性能写入，避免 json.Marshal 的分配
+			buf.WriteByte('"')
+			writeJSONString(buf, k)
+			buf.WriteString("\":")
 
 			// 写入值
 			switch val := v.(type) {
 			case *Record:
 				if val != nil {
-					nestedJSON, err := val.marshalOrderedJSONOptimized(visited, depth+1)
-					if err != nil {
-						return nil, err
+					if err := val.marshalToBuffer(buf, visited, depth+1); err != nil {
+						return err
 					}
-					buf.Write(nestedJSON)
 				} else {
 					buf.WriteString("null")
 				}
 			case Record:
-				nestedJSON, err := (&val).marshalOrderedJSONOptimized(visited, depth+1)
-				if err != nil {
-					return nil, err
+				if err := (&val).marshalToBuffer(buf, visited, depth+1); err != nil {
+					return err
 				}
-				buf.Write(nestedJSON)
 			case string:
-				// 字符串特殊处理，避免调用 json.Marshal
 				buf.WriteByte('"')
-				writeJSONString(&buf, val)
+				writeJSONString(buf, val)
 				buf.WriteByte('"')
 			case bool:
 				if val {
@@ -398,7 +619,6 @@ func (r *Record) marshalOrderedJSONOptimized(visited map[uintptr]bool, depth int
 			case nil:
 				buf.WriteString("null")
 			case []interface{}:
-				// 手动序列化数组，确保数组中的 Record 也能保持顺序
 				buf.WriteByte('[')
 				for i, item := range val {
 					if i > 0 {
@@ -407,35 +627,29 @@ func (r *Record) marshalOrderedJSONOptimized(visited map[uintptr]bool, depth int
 					switch itemVal := item.(type) {
 					case *Record:
 						if itemVal != nil {
-							nestedJSON, err := itemVal.marshalOrderedJSONOptimized(visited, depth+1)
-							if err != nil {
-								return nil, err
+							if err := itemVal.marshalToBuffer(buf, visited, depth+1); err != nil {
+								return err
 							}
-							buf.Write(nestedJSON)
 						} else {
 							buf.WriteString("null")
 						}
 					case Record:
-						nestedJSON, err := (&itemVal).marshalOrderedJSONOptimized(visited, depth+1)
-						if err != nil {
-							return nil, err
+						if err := (&itemVal).marshalToBuffer(buf, visited, depth+1); err != nil {
+							return err
 						}
-						buf.Write(nestedJSON)
 					default:
-						// 其他类型使用标准库序列化
 						itemJSON, err := json.Marshal(item)
 						if err != nil {
-							return nil, err
+							return err
 						}
 						buf.Write(itemJSON)
 					}
 				}
 				buf.WriteByte(']')
 			default:
-				// 使用标准库序列化其他类型
 				valJSON, err := json.Marshal(v)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				buf.Write(valJSON)
 			}
@@ -443,7 +657,7 @@ func (r *Record) marshalOrderedJSONOptimized(visited map[uintptr]bool, depth int
 	}
 
 	buf.WriteByte('}')
-	return buf.Bytes(), nil
+	return nil
 }
 
 // writeJSONString 优化字符串转义
@@ -548,21 +762,187 @@ func (r *Record) Clone() *Record {
 	return newRecord
 }
 
+// isBasicType 检查是否为基础类型
+func isBasicType(v interface{}) bool {
+	switch v.(type) {
+	case string, int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64, bool,
+		time.Time, time.Duration,
+		complex64, complex128,
+		uintptr:
+		return true
+	}
+	return false
+}
+
+// isBasicPointer 检查是否为基础类型指针
+func isBasicPointer(v interface{}) bool {
+	switch v.(type) {
+	case *string, *int, *int8, *int16, *int32, *int64,
+		*uint, *uint8, *uint16, *uint32, *uint64,
+		*float32, *float64, *bool,
+		*time.Time, *time.Duration,
+		*complex64, *complex128,
+		*uintptr:
+		return true
+	}
+	return false
+}
+
+// isBasicSlice 检查是否为基础类型切片
+func isBasicSlice(v interface{}) bool {
+	switch v.(type) {
+	case []string, []int, []int8, []int16, []int32, []int64,
+		[]uint, []uint8, []uint16, []uint32, []uint64,
+		[]float32, []float64, []bool:
+		return true
+	}
+	return false
+}
+
+// cloneBasicSlice 克隆基础类型切片
+func cloneBasicSlice(v interface{}) interface{} {
+	switch val := v.(type) {
+	case []string:
+		newSlice := make([]string, len(val))
+		copy(newSlice, val)
+		return newSlice
+	case []int:
+		newSlice := make([]int, len(val))
+		copy(newSlice, val)
+		return newSlice
+	case []int8:
+		newSlice := make([]int8, len(val))
+		copy(newSlice, val)
+		return newSlice
+	case []int16:
+		newSlice := make([]int16, len(val))
+		copy(newSlice, val)
+		return newSlice
+	case []int32:
+		newSlice := make([]int32, len(val))
+		copy(newSlice, val)
+		return newSlice
+	case []int64:
+		newSlice := make([]int64, len(val))
+		copy(newSlice, val)
+		return newSlice
+	case []uint:
+		newSlice := make([]uint, len(val))
+		copy(newSlice, val)
+		return newSlice
+	case []uint16:
+		newSlice := make([]uint16, len(val))
+		copy(newSlice, val)
+		return newSlice
+	case []uint32:
+		newSlice := make([]uint32, len(val))
+		copy(newSlice, val)
+		return newSlice
+	case []uint64:
+		newSlice := make([]uint64, len(val))
+		copy(newSlice, val)
+		return newSlice
+	case []float32:
+		newSlice := make([]float32, len(val))
+		copy(newSlice, val)
+		return newSlice
+	case []float64:
+		newSlice := make([]float64, len(val))
+		copy(newSlice, val)
+		return newSlice
+	case []bool:
+		newSlice := make([]bool, len(val))
+		copy(newSlice, val)
+		return newSlice
+	case []byte:
+		newByte := make([]byte, len(val))
+		copy(newByte, val)
+		return newByte
+	}
+	return nil
+}
+
 // cloneValue 辅助函数，用于克隆 interface{} 里面的值
+// clonePointer 简化指针类型的处理，为基础类型指针创建新实例并拷贝值
+func clonePointer(value interface{}) interface{} {
+	if value == nil {
+		return nil
+	}
+
+	// 通过类型断言优先处理高频的 time 类型，避免反射
+	switch v := value.(type) {
+	case *time.Time:
+		if v == nil {
+			return nil
+		}
+		newTime := *v
+		return &newTime
+	case *time.Duration:
+		if v == nil {
+			return nil
+		}
+		newDur := *v
+		return &newDur
+	}
+
+	val := reflect.ValueOf(value)
+	if val.Kind() != reflect.Ptr || val.IsNil() {
+		return value
+	}
+
+	elem := val.Elem()
+	kind := elem.Kind()
+
+	// 处理其他基础类型 (数值、布尔、字符串、uintptr、复数)
+	if (kind >= reflect.Bool && kind <= reflect.Complex128) || kind == reflect.String || kind == reflect.Uintptr {
+		newPtr := reflect.New(elem.Type())
+		newPtr.Elem().Set(elem)
+		return newPtr.Interface()
+	}
+
+	return value
+}
+
 func cloneValue(v interface{}) interface{} {
 	if v == nil {
 		return nil
+	}
+
+	// 1. 基础值类型直接返回
+	if isBasicType(v) {
+		return v
+	}
+
+	// 2. 基础类型指针处理
+	if isBasicPointer(v) {
+		return clonePointer(v)
+	}
+
+	// 3. 基础类型切片处理
+	if isBasicSlice(v) {
+		return cloneBasicSlice(v)
 	}
 
 	switch val := v.(type) {
 	case *Record:
 		// 递归克隆嵌套的 Record
 		return val.Clone()
-	case []byte:
-		newByte := make([]byte, len(val))
-		copy(newByte, val)
-		return newByte
+
 	// 常见的 map 和 slice 需要递归
+	case []*Record:
+		newSlice := make([]*Record, len(val))
+		for i, v2 := range val {
+			newSlice[i] = v2.Clone()
+		}
+		return newSlice
+	case []Record:
+		newSlice := make([]Record, len(val))
+		for i, v2 := range val {
+			newSlice[i] = *v2.Clone()
+		}
+		return newSlice
 	case map[string]interface{}:
 		newMap := make(map[string]interface{})
 		for k2, v2 := range val {
@@ -587,57 +967,113 @@ func deepCloneValue(v interface{}, tracker *recursionTracker) interface{} {
 		return nil
 	}
 
-	// 获取值的指针地址（仅对引用类型有效）
+	// 1. 基础类型（直接返回，不需要克隆也不需要追踪）
+	switch v.(type) {
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, uintptr, float32, float64, string, complex64, complex128, time.Time, time.Duration:
+		return v
+	}
+
+	// 2. 基础类型指针和基础类型切片
+	if isBasicPointer(v) {
+		return clonePointer(v)
+	}
+	if isBasicSlice(v) {
+		return cloneBasicSlice(v)
+	}
+
+	// 3. 循环引用检测
 	val := reflect.ValueOf(v)
 	var ptr uintptr
-	switch val.Kind() {
-	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Array, reflect.Chan, reflect.Func, reflect.Interface:
+	kind := val.Kind()
+	switch kind {
+	case reflect.Ptr, reflect.Map, reflect.Slice:
+		if val.IsNil() {
+			return v
+		}
 		ptr = val.Pointer()
 	default:
 		ptr = 0
 	}
 
 	if ptr != 0 {
-		// 检查是否已经克隆过
 		if cloned, ok := tracker.get(ptr); ok {
 			return cloned
 		}
 	}
 
-	switch val := v.(type) {
+	// 4. 特化类型处理
+	switch concrete := v.(type) {
 	case *Record:
-		// 使用 DeepClone 方法深拷贝 Record
-		cloned := val.DeepClone()
-		if ptr != 0 {
-			tracker.add(ptr, cloned)
+		return concrete.deepCloneWithTracker(tracker)
+
+	case Record:
+		// 对于 Record 值，其身份由 columns 映射决定
+		columnsPtr := reflect.ValueOf(concrete.columns).Pointer()
+		if cloned, ok := tracker.get(columnsPtr); ok {
+			// 如果 columns 已经克隆过，返回克隆后的 Record 值
+			return *(cloned.(*Record))
 		}
-		return cloned
-	case []byte:
-		newByte := make([]byte, len(val))
-		copy(newByte, val)
-		return newByte
+		cloned := (&concrete).deepCloneWithTracker(tracker)
+		return *cloned
+
+	case []*Record:
+		newSlice := make([]*Record, len(concrete))
+		if ptr != 0 {
+			tracker.add(ptr, newSlice)
+		}
+		for i, item := range concrete {
+			if item != nil {
+				newSlice[i] = item.deepCloneWithTracker(tracker)
+			}
+		}
+		return newSlice
+
+	case []Record:
+		newSlice := make([]Record, len(concrete))
+		if ptr != 0 {
+			tracker.add(ptr, newSlice)
+		}
+		for i := range concrete {
+			cloned := (&concrete[i]).deepCloneWithTracker(tracker)
+			newSlice[i] = *cloned
+		}
+		return newSlice
+
+	case []interface{}:
+		newSlice := make([]interface{}, len(concrete))
+		if ptr != 0 {
+			tracker.add(ptr, newSlice)
+		}
+		for i, item := range concrete {
+			newSlice[i] = deepCloneValue(item, tracker)
+		}
+		return newSlice
+
+	case map[string]*Record:
+		newMap := make(map[string]*Record)
+		if ptr != 0 {
+			tracker.add(ptr, newMap)
+		}
+		for k, item := range concrete {
+			if item != nil {
+				newMap[k] = item.deepCloneWithTracker(tracker)
+			}
+		}
+		return newMap
+
 	case map[string]interface{}:
 		newMap := make(map[string]interface{})
 		if ptr != 0 {
 			tracker.add(ptr, newMap)
 		}
-		for k2, v2 := range val {
-			newMap[k2] = deepCloneValue(v2, tracker)
+		for k, item := range concrete {
+			newMap[k] = deepCloneValue(item, tracker)
 		}
 		return newMap
-	case []interface{}:
-		newSlice := make([]interface{}, len(val))
-		if ptr != 0 {
-			tracker.add(ptr, newSlice)
-		}
-		for i, v2 := range val {
-			newSlice[i] = deepCloneValue(v2, tracker)
-		}
-		return newSlice
-	default:
-		// 对于其他类型，使用反射处理
-		return deepCloneReflect(v, tracker)
 	}
+
+	// 5. 其他类型走反射逻辑
+	return deepCloneReflect(v, tracker)
 }
 
 // deepCloneReflect 使用反射深拷贝任意类型的值
@@ -645,32 +1081,8 @@ func deepCloneReflect(v interface{}, tracker *recursionTracker) interface{} {
 	if v == nil {
 		return nil
 	}
-
 	val := reflect.ValueOf(v)
-
-	// 如果是指针，获取指针指向的值
-	if val.Kind() == reflect.Ptr {
-		if val.IsNil() {
-			return nil
-		}
-		ptr := val.Pointer()
-		if cloned, ok := tracker.get(ptr); ok {
-			return cloned
-		}
-
-		// 递归克隆指针指向的值
-		elem := val.Elem()
-		clonedElem := deepCloneReflectValue(elem, tracker)
-
-		// 创建新的指针
-		clonedPtr := reflect.New(elem.Type())
-		clonedPtr.Elem().Set(clonedElem)
-		tracker.add(ptr, clonedPtr.Interface())
-		return clonedPtr.Interface()
-	}
-
-	// 非指针类型直接返回
-	return v
+	return deepCloneReflectValue(val, tracker).Interface()
 }
 
 // deepCloneReflectValue 使用反射深拷贝 reflect.Value
@@ -679,62 +1091,115 @@ func deepCloneReflectValue(val reflect.Value, tracker *recursionTracker) reflect
 		return reflect.Value{}
 	}
 
-	switch val.Kind() {
+	// 对于可以获取指针的类型，检查循环引用
+	kind := val.Kind()
+	if kind == reflect.Ptr || kind == reflect.Map || kind == reflect.Slice {
+		if !val.IsNil() {
+			ptr := val.Pointer()
+			if cloned, ok := tracker.get(ptr); ok {
+				return reflect.ValueOf(cloned)
+			}
+		}
+	}
+
+	switch kind {
 	case reflect.Ptr:
 		if val.IsNil() {
-			return val
+			return reflect.Zero(val.Type())
 		}
-		ptr := val.Pointer()
-		if cloned, ok := tracker.get(ptr); ok {
-			return reflect.ValueOf(cloned)
-		}
+		// 指针类型特殊处理：先创建指针指向的对象
+		clonedPtr := reflect.New(val.Type().Elem())
+		// 记录指针映射
+		tracker.add(val.Pointer(), clonedPtr.Interface())
+
+		// 获取指针指向的元素
 		elem := val.Elem()
-		clonedElem := deepCloneReflectValue(elem, tracker)
-		clonedPtr := reflect.New(elem.Type())
-		clonedPtr.Elem().Set(clonedElem)
-		tracker.add(ptr, clonedPtr.Interface())
+		// 使用 deepCloneValue 处理元素，确保 Record 特化逻辑生效
+		clonedElem := deepCloneValue(elem.Interface(), tracker)
+		if clonedElem != nil {
+			clonedPtr.Elem().Set(reflect.ValueOf(clonedElem))
+		}
 		return clonedPtr
 
-	case reflect.Slice:
+	case reflect.Interface:
 		if val.IsNil() {
-			return val
+			return reflect.Zero(val.Type())
 		}
-		ptr := val.Pointer()
-		if cloned, ok := tracker.get(ptr); ok {
-			return reflect.ValueOf(cloned)
+		// 获取接口的具体值
+		elem := val.Elem()
+		// 递归克隆具体值
+		clonedElem := deepCloneReflectValue(elem, tracker)
+
+		// 确保克隆后的值可以赋值给接口
+		if !clonedElem.IsValid() {
+			return reflect.Zero(val.Type())
 		}
-		len := val.Len()
-		newSlice := reflect.MakeSlice(val.Type(), len, len)
-		tracker.add(ptr, newSlice.Interface())
-		for i := 0; i < len; i++ {
-			newSlice.Index(i).Set(deepCloneReflectValue(val.Index(i), tracker))
+
+		// 创建新的接口值
+		newInterface := reflect.New(val.Type()).Elem()
+		if clonedElem.Type().AssignableTo(val.Type()) {
+			newInterface.Set(clonedElem)
+		} else {
+			// 类型不匹配，尝试转换为 interface{}
+			newInterface.Set(reflect.ValueOf(clonedElem.Interface()))
 		}
-		return newSlice
+		return newInterface
+
+	case reflect.Struct:
+		clonedStruct := reflect.New(val.Type()).Elem()
+		for i := 0; i < val.NumField(); i++ {
+			field := val.Field(i)
+			if val.Type().Field(i).PkgPath == "" { // exported field
+				// 使用 deepCloneValue 处理结构体字段
+				clonedField := deepCloneValue(field.Interface(), tracker)
+				if clonedField != nil {
+					clonedStruct.Field(i).Set(reflect.ValueOf(clonedField))
+				}
+			}
+		}
+		return clonedStruct
 
 	case reflect.Map:
 		if val.IsNil() {
-			return val
-		}
-		ptr := val.Pointer()
-		if cloned, ok := tracker.get(ptr); ok {
-			return reflect.ValueOf(cloned)
+			return reflect.Zero(val.Type())
 		}
 		newMap := reflect.MakeMap(val.Type())
-		tracker.add(ptr, newMap.Interface())
-		for _, key := range val.MapKeys() {
-			newMap.SetMapIndex(deepCloneReflectValue(key, tracker), deepCloneReflectValue(val.MapIndex(key), tracker))
+		tracker.add(val.Pointer(), newMap.Interface())
+		for _, k := range val.MapKeys() {
+			// 使用 deepCloneValue 处理 Map 的 Key 和 Value
+			clonedKey := deepCloneValue(k.Interface(), tracker)
+			clonedVal := deepCloneValue(val.MapIndex(k).Interface(), tracker)
+
+			var kv, vv reflect.Value
+			if clonedKey != nil {
+				kv = reflect.ValueOf(clonedKey)
+			} else {
+				kv = reflect.Zero(val.Type().Key())
+			}
+
+			if clonedVal != nil {
+				vv = reflect.ValueOf(clonedVal)
+			} else {
+				vv = reflect.Zero(val.Type().Elem())
+			}
+			newMap.SetMapIndex(kv, vv)
 		}
 		return newMap
 
-	case reflect.Struct:
-		newStruct := reflect.New(val.Type()).Elem()
-		for i := 0; i < val.NumField(); i++ {
-			field := val.Field(i)
-			if field.CanInterface() {
-				newStruct.Field(i).Set(deepCloneReflectValue(field, tracker))
+	case reflect.Slice:
+		if val.IsNil() {
+			return reflect.Zero(val.Type())
+		}
+		newSlice := reflect.MakeSlice(val.Type(), val.Len(), val.Cap())
+		tracker.add(val.Pointer(), newSlice.Interface())
+		for i := 0; i < val.Len(); i++ {
+			// 使用 deepCloneValue 处理 Slice 元素
+			clonedElem := deepCloneValue(val.Index(i).Interface(), tracker)
+			if clonedElem != nil {
+				newSlice.Index(i).Set(reflect.ValueOf(clonedElem))
 			}
 		}
-		return newStruct
+		return newSlice
 
 	case reflect.Array:
 		len := val.Len()
@@ -760,13 +1225,15 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 	r.lowerKeyMap = make(map[string]string)
 	r.keys = make([]string, 0)
 
-	// 反序列化
-	if err := json.Unmarshal(data, &r.columns); err != nil {
+	// 先反序列化到临时 map
+	var tempMap map[string]interface{}
+	if err := json.Unmarshal(data, &tempMap); err != nil {
 		return err
 	}
 
-	// 重建小写映射和 keys 顺序
-	for k := range r.columns {
+	// 转换值并重建映射和顺序
+	for k, v := range tempMap {
+		r.columns[k] = r.convertJsonValue(v)
 		r.lowerKeyMap[strings.ToLower(k)] = k
 		r.keys = append(r.keys, k)
 	}
@@ -900,8 +1367,17 @@ func (r *Record) FromRecord(src *Record) *Record {
 }
 
 // DeepClone creates a deep copy of the Record
-// 创建 Record 的深拷贝，包括所有嵌套的对象
+// 创建 Record 的深拷贝，包含所有嵌套的 Record、切片和 map
 func (r *Record) DeepClone() *Record {
+	if r == nil {
+		return nil
+	}
+	tracker := newRecursionTracker()
+	return r.deepCloneWithTracker(tracker)
+}
+
+// deepCloneWithTracker 是内部使用的深拷贝实现，支持循环引用检测
+func (r *Record) deepCloneWithTracker(tracker *recursionTracker) *Record {
 	if r == nil {
 		return nil
 	}
@@ -909,15 +1385,42 @@ func (r *Record) DeepClone() *Record {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	newRecord := NewRecord()
-	tracker := newRecursionTracker()
-
-	for k, v := range r.columns {
-		newRecord.setDirect(k, deepCloneValue(v, tracker))
+	// 1. 检查是否已经处理过此指针
+	ptr := uintptr(unsafe.Pointer(r))
+	if cloned, ok := tracker.get(ptr); ok {
+		return cloned.(*Record)
 	}
-	// 复制 keys 顺序
+
+	// 2. 检查是否已经处理过此 Record 的数据内容 (通过 columns 映射识别)
+	var columnsPtr uintptr
+	if r.columns != nil {
+		columnsPtr = reflect.ValueOf(r.columns).Pointer()
+		if cloned, ok := tracker.get(columnsPtr); ok {
+			return cloned.(*Record)
+		}
+	}
+
+	// 3. 创建新 Record 并记录映射
+	newRecord := NewRecord()
+	tracker.add(ptr, newRecord)
+	if columnsPtr != 0 {
+		tracker.add(columnsPtr, newRecord)
+	}
+
+	// 4. 拷贝基本属性
 	newRecord.keys = make([]string, len(r.keys))
 	copy(newRecord.keys, r.keys)
+
+	newRecord.lowerKeyMap = make(map[string]string, len(r.lowerKeyMap))
+	for k, v := range r.lowerKeyMap {
+		newRecord.lowerKeyMap[k] = v
+	}
+
+	// 5. 深拷贝数据
+	newRecord.columns = make(map[string]interface{}, len(r.columns))
+	for k, v := range r.columns {
+		newRecord.columns[k] = deepCloneValue(v, tracker)
+	}
 
 	return newRecord
 }
@@ -944,6 +1447,9 @@ func (r *Record) FromRecordDeep(src *Record) *Record {
 
 	// 使用深拷贝复制值
 	tracker := newRecursionTracker()
+	// 记录 src 到 r 的映射，防止 src 内部引用自己时能正确指向 r
+	tracker.add(uintptr(unsafe.Pointer(src)), r)
+
 	for key, value := range src.columns {
 		r.columns[key] = deepCloneValue(value, tracker)
 		r.lowerKeyMap[strings.ToLower(key)] = key
@@ -1453,8 +1959,16 @@ func splitString(str string) []interface{} {
 	return []interface{}{str}
 }
 
+// IsEmpty checks if the Record is empty
 func (r *Record) IsEmpty() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.columns) == 0
+}
+
+// Size returns the number of columns in the Record
+func (r *Record) Size() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.columns)
 }
