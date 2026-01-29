@@ -60,7 +60,46 @@ score := record.GetFloat("score")    // 直接返回 float64
 active := record.GetBool("active")    // 直接返回 bool
 ```
 
-### 4. JSON 序列化/反序列化
+#### 批量值提取 (GetValues)
+
+当需要一次性获取多个字段时，使用 `GetValues` 可以减少加锁次数，提高性能：
+
+```go
+// 批量获取字段值
+cols := []string{"name", "age", "email"}
+values := record.GetValues(cols...)
+
+fmt.Printf("姓名: %v, 年龄: %v, 邮箱: %v\n", values[0], values[1], values[2])
+```
+
+### 4. 对象池支持 (sync.Pool)
+
+对于高性能要求的场景，EORM 提供了 Record 对象池支持。
+
+#### 适用场合
+- **高并发 API 请求**：在每秒处理成千上万个请求的 Web 服务中，使用对象池可以显著减少对象创建和销毁带来的 GC (垃圾回收) 压力。
+- **批量数据导入/导出**：当需要一次性处理成千上万条数据库记录时，复用 Record 实例能大幅降低内存抖动。
+- **循环内大量创建 Record**：在复杂的业务逻辑循环中，如果需要频繁创建临时 Record，建议使用对象池。
+- **内存敏感型应用**：对 GC 停顿时间（Pause Time）极其敏感的系统。
+
+#### 使用示例
+```go
+// 从池中获取
+record := eorm.NewRecordFromPool()
+
+// 重要：使用完毕必须通过 defer 确保归还，否则会导致对象池枯竭
+defer record.Release()
+
+record.Set("name", "张三")
+// ... 执行业务逻辑
+```
+
+#### 注意事项
+1. **必须归还**：获取后如果不调用 `Release()`，对象将无法被复用，失去了使用对象池的意义。
+2. **严禁二次使用**：调用 `Release()` 后，该 Record 实例的底层结构会被清空并放回池中。严禁在 `Release()` 之后继续读写该对象，否则会引发不可预知的数据竞争问题。
+3. **闭包/异步陷阱**：如果 Record 需要传递给异步协程（goroutine），请确保在协程内部处理完毕后再归还，或者在传递前使用 `Clone()` 创建副本（副本不需要归还）。
+
+### 5. JSON 序列化/反序列化
 
 内置 JSON 支持，方便与外部系统交互。
 
@@ -110,6 +149,59 @@ record.FromJson(jsonStr)
 
 // 从另一个 Record
 record.FromRecord(otherRecord)
+```
+
+### 7. 条件赋值与数据转换
+
+Record 提供了一系列便捷的条件赋值方法，简化逻辑判断；同时提供强大的转换功能。
+
+#### 条件赋值 (SetIf 系列)
+
+```go
+record := eorm.NewRecord()
+
+// SetIf: 只有满足条件才赋值
+isAdmin := true
+record.SetIf(isAdmin, "role", "admin")
+
+// SetIfNotNil: 只有值不为 nil 时才赋值 (常用于可选参数)
+var avatar *string = nil
+record.SetIfNotNil("avatar", avatar) // 不会设置 avatar 字段
+
+// SetIfNotEmpty: 只有字符串不为空时才赋值
+name := ""
+record.SetIfNotEmpty("nickname", name) // 不会设置 nickname 字段
+
+// SetIfNil: 只有字段当前不存在或值为 nil 时才设置默认值
+record.SetIfNil("status", "pending") 
+
+// SetIfEmpty: 只有字段当前不存在或值为空字符串时才设置默认值
+record.SetIfEmpty("title", "Untitled")
+```
+
+#### 数据批量转换 (Transform)
+
+```go
+record := eorm.NewRecord().
+    Set("name", "  张三  ").
+    Set("email", "ZhangSan@Example.Com").
+    Set("score", 85)
+
+// Transform: 转换键和值
+record.Transform(func(key string, value interface{}) interface{} {
+    if s, ok := value.(string); ok {
+        return strings.TrimSpace(s) // 去除所有字符串字段的前后空格
+    }
+    return value
+})
+
+// TransformValues: 仅转换值
+record.TransformValues(func(value interface{}) interface{} {
+    if s, ok := value.(string); ok {
+        return strings.ToLower(s) // 将所有字符串字段转为小写
+    }
+    return value
+})
 ```
 
 ## 适用环境
@@ -560,6 +652,21 @@ active := record.GetBool("active")
 if record.Has("email") {
     fmt.Println("邮箱:", record.GetString("email"))
 }
+```
+
+### 6. GetValues
+
+批量获取多个字段的值。相比于多次调用 `Get`，`GetValues` 仅需一次锁竞争，性能更优。
+
+**示例：**
+
+```go
+// 获取多个字段
+values := record.GetValues("id", "username", "status")
+
+// 配合主键提取
+pks := []string{"id", "tenant_id"}
+pkValues := record.GetValues(pks...)
 ```
 
 **复杂示例：多字段检查**

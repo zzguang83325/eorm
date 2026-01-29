@@ -238,12 +238,32 @@ func NewRecord() *Record
 ```
 创建新的 Record 实例。
 
+### NewRecordFromPool
+```go
+func NewRecordFromPool() *Record
+```
+从对象池获取 Record 实例。
+
+**适用场景：**
+- 高并发 Web API（减少 GC 压力）。
+- 批量处理成千上万条记录（降低内存分配频率）。
+- 循环内频繁创建/销毁 Record 的高性能路径。
+
+**注意：** 使用完毕后必须调用 `Release()` 归还。
+
+### Release
+```go
+func (r *Record) Release()
+```
+将 Record 归还到对象池。归还后严禁再次使用该对象。
+
 **示例：**
 ```go
-record := eorm.NewRecord()
+record := eorm.NewRecordFromPool()
+defer record.Release() // 推荐使用 defer 确保归还
+
 record.Set("name", "张三")
-record.Set("age", 25)
-record.Set("email", "zhangsan@example.com")
+// ... 执行数据库操作
 ```
 
 ### SaveRecord
@@ -378,11 +398,53 @@ record := eorm.NewRecord()
 record.Set("name", "张三").Set("age", 25).Set("email", "zhangsan@example.com")
 ```
 
+#### Record.SetIf
+```go
+func (r *Record) SetIf(condition bool, column string, value interface{}) *Record
+```
+只有当 `condition` 为 `true` 时才设置字段。
+
+#### Record.SetIfNotNil
+```go
+func (r *Record) SetIfNotNil(column string, value interface{}) *Record
+```
+只有当 `value` 不为 `nil` 时才设置字段。
+
+#### Record.SetIfNotEmpty
+```go
+func (r *Record) SetIfNotEmpty(column, value string) *Record
+```
+只有当 `value` 不为空字符串时才设置字段。
+
+#### Record.SetIfNil
+```go
+func (r *Record) SetIfNil(column string, value interface{}) *Record
+```
+只有当字段当前不存在或值为 `nil` 时才设置字段。
+
+#### Record.SetIfEmpty
+```go
+func (r *Record) SetIfEmpty(column string, value string) *Record
+```
+只有当字段当前不存在或值为空字符串时才设置字段。
+
 #### Record.Get
 ```go
 func (r *Record) Get(column string) interface{}
 ```
 获取字段值。
+
+#### Record.GetValues
+```go
+func (r *Record) GetValues(columns ...string) []interface{}
+```
+批量获取多个字段的值。该方法是线程安全的，且比多次调用 `Get` 效率更高。
+
+**示例：**
+```go
+values := record.GetValues("name", "age", "email")
+// values[0] 为 name, values[1] 为 age, values[2] 为 email
+```
 
 #### 类型安全获取方法
 ```go
@@ -473,6 +535,38 @@ func (r *Record) Clear()
 **示例：**
 ```go
 record.Clear()  // 清空记录
+```
+
+#### Record.Transform
+```go
+func (r *Record) Transform(fn func(key string, value interface{}) interface{}) *Record
+```
+批量转换 Record 中的数据（处理键和值）。
+
+**示例：**
+```go
+record.Transform(func(key string, value interface{}) interface{} {
+    if s, ok := value.(string); ok {
+        return strings.TrimSpace(s) // 去除所有字符串字段的前后空格
+    }
+    return value
+})
+```
+
+#### Record.TransformValues
+```go
+func (r *Record) TransformValues(fn func(value interface{}) interface{}) *Record
+```
+批量转换 Record 中的数据（只处理值）。
+
+**示例：**
+```go
+record.TransformValues(func(value interface{}) interface{} {
+    if s, ok := value.(string); ok {
+        return strings.ToUpper(s) // 将所有字符串转换为大写
+    }
+    return value
+})
 ```
 
 #### Record.ToMap
