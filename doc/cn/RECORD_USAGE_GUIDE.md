@@ -535,23 +535,6 @@ name := record.Get("name")
 age := record.Get("age")
 ```
 
-**复杂示例：类型断言和安全访问**
-
-```go
-// 获取嵌套对象（推荐使用 GetRecord）
-if profile, err := record.GetRecord("profile"); err == nil {
-    city := profile.GetString("city")
-    fmt.Println("城市:", city)
-}
-
-// 获取数组
-if tags, ok := record.Get("tags").([]interface{}); ok {
-    for _, tag := range tags {
-        fmt.Println("标签:", tag)
-    }
-}
-```
-
 ### 4. GetString / GetInt / GetFloat / GetBool
 
 类型安全的获取方法。
