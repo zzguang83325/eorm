@@ -347,6 +347,43 @@ func OpenDatabaseWithConfig(dbname string, config *Config) (*DB, error) {
 	return &DB{dbMgr: dbMgr}, nil
 }
 
+// OpenDatabaseWithDB 用于多个orm框架联合开发, 可以使用现有的 *sql.DB 对象,共享同一个底层的数据库连接池（MaxOpenConns, MaxIdleConns 等配置），而不需要开启两次数据库连接
+
+func OpenDatabaseWithDB(dbname string, driver DriverType, db *sql.DB) (*DB, error) {
+	if db == nil {
+		return nil, fmt.Errorf("eorm: sql.DB cannot be nil")
+	}
+
+	config := &Config{
+		Driver: driver,
+	}
+
+	dbMgr := &dbManager{
+		name:          dbname,
+		config:        config,
+		db:            db,
+		pkCache:       make(map[string][]string),
+		identityCache: make(map[string]string),
+		columnCache:   make(map[string][]ColumnInfo),
+	}
+
+	// 初始化语句缓存，防止空指针
+	cacheConfig := DefaultStmtCacheConfig()
+	cacheConfig.Enabled = false // 默认关闭
+	dbMgr.stmtCache = newStmtCache(cacheConfig)
+
+	multiMgr.mu.Lock()
+	multiMgr.databases[dbname] = dbMgr
+	if multiMgr.defaultDB == "" {
+		multiMgr.defaultDB = dbname
+		multiMgr.currentDB = dbname
+	}
+	multiMgr.mu.Unlock()
+
+	dbMgr.warmUpColumnCache()
+	return &DB{dbMgr: dbMgr}, nil
+}
+
 // Use switches to a different database by name and returns a DB object for chainable calls
 // This is a convenience method that avoids panicking for fluent API usage.
 // If the database is not found or another error occurs, the error is stored in the returned DB object
@@ -3018,6 +3055,9 @@ func processDBValue(val interface{}, dbType string) interface{} {
 	// 目前保持通用逻辑，仅对 []byte 这一重灾区做特殊加固
 
 	return val
+}
+func ScanRecords(rows *sql.Rows) ([]*Record, error) {
+	return scanRecords(rows, "")
 }
 
 // scanRecords 优化版本 - 直接扫描到Record，避免中间map转换
