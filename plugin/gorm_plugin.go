@@ -16,9 +16,54 @@ import (
 
 var errSkipGorm = errors.New("eorm: skip gorm default callback")
 
+// Config 插件配置
+type Config struct {
+	DBName                string // eorm 数据库实例名称，默认为 "default"
+	EnableCache           bool
+	MaxCacheSize          int
+	EnableAutoTransaction bool // 是否在写操作时自动开启事务
+}
+
 // EormGormPlugin 适配 eorm.Record 的 GORM 插件
 type EormGormPlugin struct {
 	typeCache sync.Map
+	Config    Config
+}
+
+func (p *EormGormPlugin) logDebug(format string, v ...interface{}) {
+	fmt.Printf("[DEBUG] "+format+"\n", v...)
+}
+
+// cleanupCache 定期清理过大的缓存
+func (p *EormGormPlugin) cleanupCache() {
+	var count int
+	p.typeCache.Range(func(key, value interface{}) bool {
+		count++
+		if count > p.Config.MaxCacheSize {
+			p.typeCache.Delete(key)
+		}
+		return true
+	})
+
+	if count > p.Config.MaxCacheSize/2 {
+		p.logDebug("Type cache size: %d", count)
+	}
+}
+
+// startCacheCleanup 在插件初始化时启动定时清理
+func (p *EormGormPlugin) startCacheCleanup() {
+	if !p.Config.EnableCache {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			p.cleanupCache()
+		}
+	}()
 }
 
 func (p *EormGormPlugin) Name() string {
@@ -50,6 +95,23 @@ type whereClauseCache struct {
 
 // Initialize 初始化插件
 func (p *EormGormPlugin) Initialize(db *gorm.DB) error {
+	// 默认配置
+	if p.Config.DBName == "" {
+		p.Config.DBName = "default"
+	}
+	if p.Config.MaxCacheSize == 0 {
+		p.Config.MaxCacheSize = 1000
+		p.Config.EnableCache = true
+	}
+
+	// 自动注册 eorm 数据库实例
+	if err := p.autoRegisterEorm(db); err != nil {
+		return fmt.Errorf("eorm: failed to auto register database: %v", err)
+	}
+
+	// 启动定时清理
+	p.startCacheCleanup()
+
 	// 拦截 Find 方法
 	db.Callback().Query().Before("gorm:query").Register("eorm:before_query", p.beforeQuery)
 	db.Callback().Query().After("gorm:query").Register("eorm:after_query", p.afterQuery)
@@ -67,6 +129,34 @@ func (p *EormGormPlugin) Initialize(db *gorm.DB) error {
 	p.replaceGormCallbacks(db)
 
 	return nil
+}
+
+func (p *EormGormPlugin) autoRegisterEorm(db *gorm.DB) error {
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+
+	dialect := db.Dialector.Name()
+	var eormDriver eorm.DriverType
+
+	switch dialect {
+	case "postgres":
+		eormDriver = eorm.PostgreSQL
+	case "mysql":
+		eormDriver = eorm.MySQL
+	case "sqlite":
+		eormDriver = eorm.SQLite3
+	case "sqlserver":
+		eormDriver = eorm.SQLServer
+	case "oracle":
+		eormDriver = eorm.Oracle
+	default:
+		return fmt.Errorf("unsupported gorm dialect: %s", dialect)
+	}
+
+	_, err = eorm.OpenDatabaseWithDB(p.Config.DBName, eormDriver, sqlDB)
+	return err
 }
 
 func (p *EormGormPlugin) replaceGormCallbacks(db *gorm.DB) {
@@ -142,7 +232,16 @@ func (p *EormGormPlugin) detectDestType(dest interface{}) string {
 // detectDestTypeByReflect 使用反射检测自定义类型
 func (p *EormGormPlugin) detectDestTypeByReflect(dest interface{}) string {
 	rv := reflect.ValueOf(dest)
-	if rv.Kind() != reflect.Ptr {
+
+	// 允许 interface{} 类型包装
+	if rv.Kind() == reflect.Interface && !rv.IsNil() {
+		elem := rv.Elem()
+		if elem.Kind() == reflect.Ptr {
+			rv = elem
+		}
+	}
+
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
 		return ""
 	}
 
@@ -191,9 +290,44 @@ func (p *EormGormPlugin) isExactlyRecordType(t reflect.Type) bool {
 
 // withTransactionContext 事务上下文处理
 func (p *EormGormPlugin) withTransactionContext(db *gorm.DB, fn func(*gorm.DB) error) error {
-	// 如果已经在事务中，直接使用当前 db
-	// 如果不在事务中，直接执行，不开启额外事务，由 GORM 外部控制或直接执行 SQL
+	// 检查是否在事务中
+	if p.isInTransaction(db) {
+		return fn(db)
+	}
+
+	// 只有在用户明确配置了 EnableAutoTransaction 且为写操作时，才自动开启事务
+	if p.Config.EnableAutoTransaction && p.isWriteOperation(db.Statement) {
+		return db.Transaction(fn, &sql.TxOptions{
+			Isolation: sql.LevelDefault,
+		})
+	}
+
+	// 否则直接执行，由外部或底层驱动控制
 	return fn(db)
+}
+
+func (p *EormGormPlugin) isWriteOperation(stmt *gorm.Statement) bool {
+	if stmt == nil {
+		return false
+	}
+
+	// 1. 优先通过 SQL 语句判断
+	sqlStr := strings.ToUpper(strings.TrimSpace(stmt.SQL.String()))
+	if sqlStr != "" {
+		if strings.HasPrefix(sqlStr, "INSERT") || strings.HasPrefix(sqlStr, "UPDATE") || strings.HasPrefix(sqlStr, "DELETE") {
+			return true
+		}
+	}
+
+	// 2. 检查操作类型 (针对 GORM 内部构建过程)
+	for _, clause := range stmt.BuildClauses {
+		switch clause {
+		case "INSERT", "UPDATE", "DELETE":
+			return true
+		}
+	}
+
+	return false
 }
 
 // withSavepoint 处理嵌套事务的保存点
@@ -237,17 +371,15 @@ func (p *EormGormPlugin) getTransactionFromContext(db *gorm.DB) *gorm.DB {
 
 // isReadOnly 检测操作是否为只读
 func (p *EormGormPlugin) isReadOnly(stmt *gorm.Statement) bool {
-	// 简单的只读检测逻辑：如果是 Query 回调触发的通常是只读
-	// 也可以根据具体业务需求扩展
-	return false
+	return stmt != nil && !p.isWriteOperation(stmt)
 }
 
 // isInTransaction 检查是否已经在事务中
 func (p *EormGormPlugin) isInTransaction(db *gorm.DB) bool {
-	if db.Statement.ConnPool == nil {
+	if db == nil || db.Statement == nil || db.Statement.ConnPool == nil {
 		return false
 	}
-	// GORM 在事务中时，ConnPool 通常是 gorm.TxCommitter 类型
+	// GORM 在事务中时，ConnPool 会实现 TxCommitter 接口
 	_, ok := db.Statement.ConnPool.(gorm.TxCommitter)
 	return ok
 }
@@ -257,20 +389,42 @@ func (p *EormGormPlugin) isValidTransaction(tx *gorm.DB) bool {
 	return tx != nil && tx.Error == nil && p.isInTransaction(tx)
 }
 
+// getTableName 获取表名
+func (p *EormGormPlugin) getTableName(db *gorm.DB) string {
+	if db.Statement == nil {
+		return ""
+	}
+	if db.Statement.Table != "" {
+		return db.Statement.Table
+	}
+	if db.Statement.Schema != nil {
+		return db.Statement.Schema.Table
+	}
+	return ""
+}
+
 // handleRecordError 统一错误处理并添加上下文信息
 func (p *EormGormPlugin) handleRecordError(db *gorm.DB, operation string, err error) {
 	if err == nil {
 		return
 	}
 
-	// 添加操作上下文信息
-	wrappedErr := fmt.Errorf("eorm plugin %s failed: %w", operation, err)
-
-	// 如果有 SQL 语句，也记录下来方便排查
-	if db.Statement.SQL.String() != "" {
-		wrappedErr = fmt.Errorf("%w (SQL: %s)", wrappedErr, db.Statement.SQL.String())
+	// 添加更多上下文信息
+	ctx := []string{
+		fmt.Sprintf("eorm plugin %s failed", operation),
 	}
 
+	if table := p.getTableName(db); table != "" {
+		ctx = append(ctx, fmt.Sprintf("table: %s", table))
+	}
+
+	if db.Statement != nil && db.Statement.SQL.String() != "" {
+		ctx = append(ctx, fmt.Sprintf("SQL: %s", db.Statement.SQL.String()))
+	}
+
+	ctx = append(ctx, fmt.Sprintf("error: %v", err))
+
+	wrappedErr := errors.New(strings.Join(ctx, ", "))
 	db.AddError(wrappedErr)
 }
 
@@ -429,31 +583,15 @@ func (p *EormGormPlugin) afterQuery(db *gorm.DB) {
 		db.Statement.Build(db.Statement.BuildClauses...)
 	}
 
-	sqlStr := db.Statement.SQL.String()
 	table := db.Statement.Table
 	if table == "" && db.Statement.Schema != nil {
 		table = db.Statement.Schema.Table
 	}
 
-	// 1. 如果 SQL 为空或不包含 SELECT，手动构建基础查询
-	upperSQL := strings.ToUpper(strings.TrimSpace(sqlStr))
-	if sqlStr == "" || !strings.HasPrefix(upperSQL, "SELECT") {
-		if table != "" {
-			if sqlStr == "" {
-				sqlStr = fmt.Sprintf("SELECT * FROM %s", table)
-			} else {
-				// 处理只有 WHERE/LIMIT 等子句的情况
-				if !strings.Contains(upperSQL, "FROM") {
-					sqlStr = fmt.Sprintf("SELECT * FROM %s %s", table, sqlStr)
-				} else {
-					sqlStr = fmt.Sprintf("SELECT * %s", sqlStr)
-				}
-			}
-		}
-	}
+	// 使用 buildSafeSQL 获取更安全的查询 SQL
+	sqlStr := p.buildSafeSQL(db, table)
 
-	// 2. 移除多余的空格并确保占位符与驱动匹配 (PostgreSQL 使用 $1, $2...)
-	// GORM 的 Build 过程通常已经处理了占位符转换，但我们要确保万无一失
+	// 更新 Statement 中的 SQL
 	db.Statement.SQL.Reset()
 	db.Statement.SQL.WriteString(sqlStr)
 
@@ -480,6 +618,27 @@ func (p *EormGormPlugin) afterQuery(db *gorm.DB) {
 	case typeRecord:
 		p.handleRecord(db, rows)
 	}
+}
+
+func (p *EormGormPlugin) buildSafeSQL(db *gorm.DB, table string) string {
+	sqlStr := db.Statement.SQL.String()
+	upperSQL := strings.ToUpper(strings.TrimSpace(sqlStr))
+
+	// 如果 SQL 为空，构建基础查询
+	if sqlStr == "" && table != "" {
+		return fmt.Sprintf("SELECT * FROM %s", table)
+	}
+
+	// 如果有 WHERE 但没有 SELECT，添加 SELECT
+	if sqlStr != "" && !strings.HasPrefix(upperSQL, "SELECT") {
+		if !strings.Contains(upperSQL, "FROM") && table != "" {
+			return fmt.Sprintf("SELECT * FROM %s %s", table, sqlStr)
+		} else if strings.Contains(upperSQL, "FROM") {
+			return fmt.Sprintf("SELECT * %s", sqlStr)
+		}
+	}
+
+	return sqlStr
 }
 
 // 处理 []eorm.Record

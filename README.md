@@ -11,6 +11,7 @@ EORM (easy orm)是一个基于 Go 语言的高性能的数据库ORM框架。它�
 - **数据库支持**: 支持 MySQL、PostgreSQL、SQLite、SQL Server、Oracle
 - **多数据库管理**：支持同时连接多个数据库，并能轻松在它们之间切换。 
 - **Record 对象**：摆脱繁琐的 Struct 定义，使用灵活的 `Record` 对数据进行 CRUD,灵感来源于Jfinal。
+
 - **DbModel体验**:  在Record对象之外,可通过自动生成的DbModel对象，对数据CRUD。 
 - **SQL 模板**: 支持 SQL 配置化管理，动态参数构建，支持可变参数 - [详细指南](doc/cn/SQL_TEMPLATE_GUIDE.md)
 - **事务支持**:  提供简单易用的事务包装器及底层事务控制 
@@ -24,7 +25,7 @@ EORM (easy orm)是一个基于 Go 语言的高性能的数据库ORM框架。它�
 - **自动时间戳**: 支持配置自动时间戳字段，插入和更新时自动填充 created_at 和 updated_at
 - **软删除支持**: 支持配置软删除字段（时间戳/布尔值），自动过滤已删除记录，提供恢复和物理删除功能
 - **乐观锁支持**: 支持配置版本字段，自动检测并发冲突，防止数据覆盖
-
+- **GORM 无缝集成**：通过 `EormGormPlugin` 插件，让 GORM 原生支持 `Record` 操作，让两个ORM共享连接池与事务。 - [详细指南](plugin/README.md)
 
 
 ## 安装
@@ -186,6 +187,31 @@ eorm.WithCountCache(time.Minute*5).Paginate(page, perPage, "SELECT * from tablen
 ```
 
 
+
+#### GORM 插件集成 (无缝支持 Record)
+
+eorm 提供了对 GORM 的深度集成，让你可以直接在 GORM 中使用 `Record` 而无需定义 `struct`：
+
+```go
+import (
+    "github.com/zzguang83325/eorm"
+    "github.com/zzguang83325/eorm/plugin"
+    "gorm.io/gorm"
+)
+
+// 1. 注册插件（自动共享 GORM 连接池）
+db.Use(&plugin.EormGormPlugin{})
+
+// 2. 直接使用 GORM API 操作 Record
+var user eorm.Record
+db.Table("users").First(&user, 1)
+
+// 3. 极其方便地返回嵌套数据给前端
+user.Set("roles", []string{"admin", "editor"})
+fmt.Println(user.ToJson())
+```
+
+更多高级用法请参考：[GORM 插件详细文档](plugin/README.md)
 
 #### DbModel的基本使用
 
