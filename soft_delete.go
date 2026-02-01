@@ -190,11 +190,7 @@ func (db *DB) ConfigSoftDeleteWithType(table, field string, deleteType SoftDelet
 
 	// 检查软删除字段是否存在
 	if field != "" && !db.dbMgr.checkTableColumn(table, field) {
-		LogWarn(fmt.Sprintf("软删除配置警告: 表 '%s' 中不存在字段 '%s'", table, field), map[string]interface{}{
-			"db":    db.dbMgr.name,
-			"table": table,
-			"field": field,
-		})
+		LogWarn(fmt.Sprintf("软删除配置警告: 表 '%s' 中不存在字段 '%s'", table, field), NewRecord().Set("db", db.dbMgr.name).Set("table", table).Set("field", field))
 	}
 
 	db.dbMgr.setSoftDeleteConfig(table, &SoftDeleteConfig{
@@ -644,10 +640,7 @@ func (mgr *dbManager) hasSoftDeleteConditionInSQL(sql, table string, config *Sof
 		regex, err := getCompiledRegex(caseInsensitivePattern)
 		if err != nil {
 			// 如果正则表达式编译失败，跳过这个模式
-			LogWarn("QueryWithOutTrashed: 正则表达式编译失败", map[string]interface{}{
-				"pattern": caseInsensitivePattern,
-				"error":   err.Error(),
-			})
+			LogWarn("QueryWithOutTrashed: 正则表达式编译失败", NewRecord().Set("pattern", caseInsensitivePattern).Set("error", err.Error()))
 			continue
 		}
 		if regex.MatchString(sql) { // 使用原始SQL，因为正则表达式已经是不区分大小写的
@@ -806,9 +799,8 @@ func (mgr *dbManager) analyzeSQLForSoftDelete(sql string) (*sqlAnalysisResult, e
 
 	// 输入验证
 	if strings.TrimSpace(sql) == "" {
-		LogWarn("QueryWithOutTrashed: 空 SQL 语句", map[string]interface{}{
-			"db": mgr.name,
-		})
+		LogWarn("QueryWithOutTrashed: 空 SQL 语句", NewRecord().
+			Set("db", mgr.name))
 		return result, nil
 	}
 
@@ -818,10 +810,9 @@ func (mgr *dbManager) analyzeSQLForSoftDelete(sql string) (*sqlAnalysisResult, e
 	result.tableAliases = aliases
 
 	if len(tables) == 0 {
-		LogInfo("QueryWithOutTrashed: 未检测到表名", map[string]interface{}{
-			"db":  mgr.name,
-			"sql": sql,
-		})
+		LogInfo("QueryWithOutTrashed: 未检测到表名", NewRecord().
+			Set("db", mgr.name).
+			Set("sql", sql))
 		return result, nil
 	}
 
@@ -831,10 +822,8 @@ func (mgr *dbManager) analyzeSQLForSoftDelete(sql string) (*sqlAnalysisResult, e
 
 	// 3. 如果没有软删除表，直接返回
 	if len(softDeleteTables) == 0 {
-		LogDebug("QueryWithOutTrashed: 无软删除表配置", map[string]interface{}{
-			"db":     mgr.name,
-			"tables": tables,
-		})
+		LogDebug("QueryWithOutTrashed: 无软删除表配置", NewRecord().Set("db", mgr.name).Set("tables", tables))
+
 		return result, nil
 	}
 
@@ -843,10 +832,7 @@ func (mgr *dbManager) analyzeSQLForSoftDelete(sql string) (*sqlAnalysisResult, e
 	for _, table := range softDeleteTables {
 		config := mgr.getSoftDeleteConfig(table)
 		if config == nil {
-			LogWarn("QueryWithOutTrashed: 软删除配置丢失", map[string]interface{}{
-				"db":    mgr.name,
-				"table": table,
-			})
+			LogWarn("QueryWithOutTrashed: 软删除配置丢失", NewRecord().Set("db", mgr.name).Set("table", table))
 			continue
 		}
 
@@ -864,11 +850,11 @@ func (mgr *dbManager) analyzeSQLForSoftDelete(sql string) (*sqlAnalysisResult, e
 			// 构建建议的条件
 			detectionResult.suggestedCondition = mgr.buildConditionForTable(table, config, alias)
 
-			LogDebug("QueryWithOutTrashed: 需要注入软删除条件", map[string]interface{}{
-				"db":        mgr.name,
-				"table":     table,
-				"condition": detectionResult.suggestedCondition,
-			})
+			LogDebug("QueryWithOutTrashed: 需要注入软删除条件", NewRecord().
+				Set("db", mgr.name).
+				Set("table", table).
+				Set("condition", detectionResult.suggestedCondition))
+
 		}
 
 		result.detectionResults[table] = detectionResult
@@ -887,20 +873,18 @@ func (mgr *dbManager) analyzeSQLForSoftDelete(sql string) (*sqlAnalysisResult, e
 
 		modifiedSQL, err := mgr.injectSoftDeleteConditions(sql, tableConfigs, aliases)
 		if err != nil {
-			LogError("QueryWithOutTrashed: 条件注入失败", map[string]interface{}{
-				"db":    mgr.name,
-				"sql":   sql,
-				"error": err.Error(),
-			})
+			LogError("QueryWithOutTrashed: 条件注入失败", NewRecord().
+				Set("db", mgr.name).
+				Set("sql", sql).
+				Set("error", err.Error()))
 			return nil, fmt.Errorf("%w: %v", errConditionInjectionFailed, err)
 		}
 		result.modifiedSQL = modifiedSQL
 
-		LogDebug("QueryWithOutTrashed: SQL 修改成功", map[string]interface{}{
-			"db":          mgr.name,
-			"originalSQL": sql,
-			"modifiedSQL": modifiedSQL,
-		})
+		LogDebug("QueryWithOutTrashed: SQL 修改成功", NewRecord().
+			Set("db", mgr.name).
+			Set("originalSQL", sql).
+			Set("modifiedSQL", modifiedSQL))
 	}
 
 	return result, nil

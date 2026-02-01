@@ -140,15 +140,7 @@ func Update(table string, record *Record, whereSql string, whereArgs ...interfac
 	if err != nil {
 		return 0, err
 	}
-	sdb, err := db.dbMgr.getDB()
-	if err != nil {
-		return 0, err
-	}
-	// 如果特性检查都关闭，直接使用快速路径
-	if !db.dbMgr.enableTimestampCheck && !db.dbMgr.enableOptimisticLockCheck {
-		return db.dbMgr.updateRecordFast(sdb, table, record, whereSql, whereArgs...)
-	}
-	return db.dbMgr.update(sdb, table, record, whereSql, whereArgs...)
+	return db.Update(table, record, whereSql, whereArgs...)
 }
 
 // UpdateFast is a lightweight update that always skips timestamp and optimistic lock checks.
@@ -158,11 +150,7 @@ func UpdateFast(table string, record *Record, whereSql string, whereArgs ...inte
 	if err != nil {
 		return 0, err
 	}
-	sdb, err := db.dbMgr.getDB()
-	if err != nil {
-		return 0, err
-	}
-	return db.dbMgr.updateRecordFast(sdb, table, record, whereSql, whereArgs...)
+	return db.UpdateFast(table, record, whereSql, whereArgs...)
 }
 
 func Delete(table string, whereSql string, whereArgs ...interface{}) (int64, error) {
@@ -205,6 +193,80 @@ func BatchDeleteRecord(table string, records []*Record, batchSize ...int) (int64
 		return 0, err
 	}
 	return db.BatchDeleteRecord(table, records, batchSize...)
+}
+
+// --- Package-level functions with Executor support (for plugins/transactions) ---
+
+func SaveRecordWithExecutor(executor SqlExecutor, table string, record *Record) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.WithExecutor(executor).SaveRecord(table, record)
+}
+
+func InsertRecordWithExecutor(executor SqlExecutor, table string, record *Record) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.WithExecutor(executor).InsertRecord(table, record)
+}
+
+func BatchInsertRecordWithExecutor(executor SqlExecutor, table string, records []*Record, batchSize ...int) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.WithExecutor(executor).BatchInsertRecord(table, records, batchSize...)
+}
+
+func UpdateWithExecutor(executor SqlExecutor, table string, record *Record, whereSql string, whereArgs ...interface{}) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.WithExecutor(executor).Update(table, record, whereSql, whereArgs...)
+}
+
+func UpdateRecordWithExecutor(executor SqlExecutor, table string, record *Record) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.WithExecutor(executor).UpdateRecord(table, record)
+}
+
+func BatchUpdateRecordWithExecutor(executor SqlExecutor, table string, records []*Record, batchSize ...int) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.WithExecutor(executor).BatchUpdateRecord(table, records, batchSize...)
+}
+
+func DeleteWithExecutor(executor SqlExecutor, table string, whereSql string, whereArgs ...interface{}) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.WithExecutor(executor).Delete(table, whereSql, whereArgs...)
+}
+
+func DeleteRecordWithExecutor(executor SqlExecutor, table string, record *Record) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.WithExecutor(executor).DeleteRecord(table, record)
+}
+
+func BatchDeleteRecordWithExecutor(executor SqlExecutor, table string, records []*Record, batchSize ...int) (int64, error) {
+	db, err := defaultDB()
+	if err != nil {
+		return 0, err
+	}
+	return db.WithExecutor(executor).BatchDeleteRecord(table, records, batchSize...)
 }
 
 // BatchDeleteByIds deletes records by primary key IDs
@@ -442,9 +504,7 @@ func (db *DB) RedisCache(cacheRepositoryName string, ttl ...time.Duration) *DB {
 	redisCache := GetRedisCacheInstance()
 	if redisCache == nil {
 		// 如果 Redis 缓存未初始化，记录错误但不中断链式调用
-		LogError("Redis cache not initialized for DB", map[string]interface{}{
-			"cacheRepositoryName": cacheRepositoryName,
-		})
+		LogError("Redis cache not initialized for DB", NewRecord().Set("cacheRepositoryName", cacheRepositoryName))
 		return db
 	}
 
@@ -479,7 +539,7 @@ func (db *DB) Query(querySQL string, args ...interface{}) ([]*Record, error) {
 	}
 	ctx, cancel := db.getContext()
 	defer cancel()
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return nil, err
 	}
@@ -493,13 +553,13 @@ func (db *DB) Query(querySQL string, args ...interface{}) ([]*Record, error) {
 			}
 		}
 
-		results, err := db.dbMgr.queryWithContext(ctx, sdb, querySQL, args...)
+		results, err := db.dbMgr.queryWithContext(ctx, executor, querySQL, args...)
 		if err == nil {
 			cache.CacheSet(db.cacheRepositoryName, key, results, getEffectiveTTL(db.cacheRepositoryName, db.cacheTTL))
 		}
 		return results, err
 	}
-	return db.dbMgr.queryWithContext(ctx, sdb, querySQL, args...)
+	return db.dbMgr.queryWithContext(ctx, executor, querySQL, args...)
 }
 
 func (db *DB) QueryFirst(querySQL string, args ...interface{}) (*Record, error) {
@@ -509,7 +569,7 @@ func (db *DB) QueryFirst(querySQL string, args ...interface{}) (*Record, error) 
 	ctx, cancel := db.getContext()
 	defer cancel()
 
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return nil, err
 	}
@@ -522,13 +582,13 @@ func (db *DB) QueryFirst(querySQL string, args ...interface{}) (*Record, error) 
 				return result, nil
 			}
 		}
-		result, err := db.dbMgr.queryFirstWithContext(ctx, sdb, querySQL, args...)
+		result, err := db.dbMgr.queryFirstWithContext(ctx, executor, querySQL, args...)
 		if err == nil && result != nil {
 			cache.CacheSet(db.cacheRepositoryName, key, result, getEffectiveTTL(db.cacheRepositoryName, db.cacheTTL))
 		}
 		return result, err
 	}
-	return db.dbMgr.queryFirstWithContext(ctx, sdb, querySQL, args...)
+	return db.dbMgr.queryFirstWithContext(ctx, executor, querySQL, args...)
 }
 
 func (db *DB) QueryToDbModel(dest interface{}, querySQL string, args ...interface{}) error {
@@ -556,7 +616,7 @@ func (db *DB) QueryMap(querySQL string, args ...interface{}) ([]map[string]inter
 	}
 	ctx, cancel := db.getContext()
 	defer cancel()
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return nil, err
 	}
@@ -569,13 +629,13 @@ func (db *DB) QueryMap(querySQL string, args ...interface{}) ([]map[string]inter
 				return results, nil
 			}
 		}
-		results, err := db.dbMgr.queryMapWithContext(ctx, sdb, querySQL, args...)
+		results, err := db.dbMgr.queryMapWithContext(ctx, executor, querySQL, args...)
 		if err == nil {
 			cache.CacheSet(db.cacheRepositoryName, key, results, getEffectiveTTL(db.cacheRepositoryName, db.cacheTTL))
 		}
 		return results, err
 	}
-	return db.dbMgr.queryMapWithContext(ctx, sdb, querySQL, args...)
+	return db.dbMgr.queryMapWithContext(ctx, executor, querySQL, args...)
 }
 
 // QueryWithOutTrashed 执行原始 SQL 查询并自动过滤软删除数据
@@ -632,13 +692,13 @@ func (db *DB) Exec(querySQL string, args ...interface{}) (sql.Result, error) {
 	if db.lastErr != nil {
 		return nil, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := db.getContext()
 	defer cancel()
-	res, err := db.dbMgr.execWithContext(ctx, sdb, querySQL, args...)
+	res, err := db.dbMgr.execWithContext(ctx, executor, querySQL, args...)
 	if err == nil && db.cacheRepositoryName != "" {
 		db.ClearCache(db.cacheRepositoryName)
 	}
@@ -654,8 +714,8 @@ func (db *DB) BatchExec(sqls []string, args ...[]interface{}) ([]StatementResult
 		return nil, db.lastErr
 	}
 
-	// 获取数据库连接
-	sdb, err := db.dbMgr.getDB()
+	// 获取执行器
+	executor, err := db.getExecutor()
 	if err != nil {
 		return nil, err
 	}
@@ -671,7 +731,7 @@ func (db *DB) BatchExec(sqls []string, args ...[]interface{}) ([]StatementResult
 	}
 
 	// 调用 dbMgr.batchExecWithContext
-	return db.dbMgr.batchExecWithContext(ctx, sdb, sqls, actualArgs)
+	return db.dbMgr.batchExecWithContext(ctx, executor, sqls, actualArgs)
 }
 
 // 如果是单一 int64 主键且数据库返回了 ID，会自动回填到 record 中
@@ -679,15 +739,15 @@ func (db *DB) SaveRecord(table string, record *Record) (int64, error) {
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
-	id, err := db.dbMgr.saveRecord(sdb, table, record)
+	id, err := db.dbMgr.saveRecord(executor, table, record)
 	if err == nil && db.cacheRepositoryName != "" {
 		db.ClearCache(db.cacheRepositoryName)
 	}
-	pks, _ := db.dbMgr.getPrimaryKeys(sdb, table)
+	pks, _ := db.dbMgr.getPrimaryKeys(executor, table)
 	if len(pks) == 1 && db.dbMgr.isInt64PrimaryKey(table, pks[0]) {
 		if !record.Has(pks[0]) {
 			record.Set(pks[0], id) // 把ID回填到record
@@ -702,15 +762,15 @@ func (db *DB) InsertRecord(table string, record *Record) (int64, error) {
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
-	id, err := db.dbMgr.insertRecord(sdb, table, record)
+	id, err := db.dbMgr.insertRecord(executor, table, record)
 	if err == nil && db.cacheRepositoryName != "" {
 		db.ClearCache(db.cacheRepositoryName)
 	}
-	pks, _ := db.dbMgr.getPrimaryKeys(sdb, table)
+	pks, _ := db.dbMgr.getPrimaryKeys(executor, table)
 	if len(pks) == 1 && db.dbMgr.isInt64PrimaryKey(table, pks[0]) {
 		if !record.Has(pks[0]) {
 			record.Set(pks[0], id) // 把ID回填到record
@@ -724,11 +784,11 @@ func (db *DB) UpdateRecord(table string, record *Record) (int64, error) {
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
-	id, err := db.dbMgr.updateRecord(sdb, table, record)
+	id, err := db.dbMgr.updateRecord(executor, table, record)
 
 	return id, err
 }
@@ -737,18 +797,18 @@ func (db *DB) insertWithOptions(table string, record *Record, skipTimestamps boo
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
-	return db.dbMgr.insertRecordWithOptions(sdb, table, record, skipTimestamps)
+	return db.dbMgr.insertRecordWithOptions(executor, table, record, skipTimestamps)
 }
 
 func (db *DB) Update(table string, record *Record, whereSql string, whereArgs ...interface{}) (int64, error) {
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
@@ -756,9 +816,9 @@ func (db *DB) Update(table string, record *Record, whereSql string, whereArgs ..
 	var rows int64
 	// If both feature checks are disabled, use fast path directly
 	if !db.dbMgr.enableTimestampCheck && !db.dbMgr.enableOptimisticLockCheck {
-		rows, err = db.dbMgr.updateRecordFast(sdb, table, record, whereSql, whereArgs...)
+		rows, err = db.dbMgr.updateRecordFast(executor, table, record, whereSql, whereArgs...)
 	} else {
-		rows, err = db.dbMgr.update(sdb, table, record, whereSql, whereArgs...)
+		rows, err = db.dbMgr.update(executor, table, record, whereSql, whereArgs...)
 	}
 
 	if err == nil && db.cacheRepositoryName != "" {
@@ -772,33 +832,33 @@ func (db *DB) UpdateFast(table string, record *Record, whereSql string, whereArg
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
-	return db.dbMgr.updateRecordFast(sdb, table, record, whereSql, whereArgs...)
+	return db.dbMgr.updateRecordFast(executor, table, record, whereSql, whereArgs...)
 }
 
 func (db *DB) updateWithOptions(table string, record *Record, whereSql string, skipTimestamps bool, whereArgs ...interface{}) (int64, error) {
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
-	return db.dbMgr.updateRecordWithOptions(sdb, table, record, whereSql, skipTimestamps, whereArgs...)
+	return db.dbMgr.updateRecordWithOptions(executor, table, record, whereSql, skipTimestamps, whereArgs...)
 }
 
 func (db *DB) Delete(table string, whereSql string, whereArgs ...interface{}) (int64, error) {
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
-	rows, err := db.dbMgr.delete(sdb, table, whereSql, whereArgs...)
+	rows, err := db.dbMgr.delete(executor, table, whereSql, whereArgs...)
 	if err == nil && db.cacheRepositoryName != "" {
 		db.ClearCache(db.cacheRepositoryName)
 	}
@@ -809,18 +869,18 @@ func (db *DB) DeleteRecord(table string, record *Record) (int64, error) {
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
-	return db.dbMgr.deleteRecord(sdb, table, record)
+	return db.dbMgr.deleteRecord(executor, table, record)
 }
 
 func (db *DB) BatchInsertRecord(table string, records []*Record, batchSize ...int) (int64, error) {
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
@@ -829,7 +889,7 @@ func (db *DB) BatchInsertRecord(table string, records []*Record, batchSize ...in
 	if len(batchSize) > 0 && batchSize[0] > 0 {
 		size = batchSize[0]
 	}
-	return db.dbMgr.batchInsertRecord(sdb, table, records, size)
+	return db.dbMgr.batchInsertRecord(executor, table, records, size)
 }
 
 // BatchUpdateRecord updates multiple records by primary key
@@ -837,7 +897,7 @@ func (db *DB) BatchUpdateRecord(table string, records []*Record, batchSize ...in
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
@@ -846,7 +906,7 @@ func (db *DB) BatchUpdateRecord(table string, records []*Record, batchSize ...in
 	if len(batchSize) > 0 && batchSize[0] > 0 {
 		size = batchSize[0]
 	}
-	return db.dbMgr.batchUpdateRecord(sdb, table, records, size)
+	return db.dbMgr.batchUpdateRecord(executor, table, records, size)
 }
 
 // BatchDeleteRecord deletes multiple records by primary key
@@ -854,7 +914,7 @@ func (db *DB) BatchDeleteRecord(table string, records []*Record, batchSize ...in
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
@@ -863,7 +923,7 @@ func (db *DB) BatchDeleteRecord(table string, records []*Record, batchSize ...in
 	if len(batchSize) > 0 && batchSize[0] > 0 {
 		size = batchSize[0]
 	}
-	return db.dbMgr.batchDeleteRecord(sdb, table, records, size)
+	return db.dbMgr.batchDeleteRecord(executor, table, records, size)
 }
 
 // BatchDeleteByIds deletes records by primary key IDs
@@ -871,7 +931,7 @@ func (db *DB) BatchDeleteByIds(table string, ids []interface{}, batchSize ...int
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
@@ -880,14 +940,14 @@ func (db *DB) BatchDeleteByIds(table string, ids []interface{}, batchSize ...int
 	if len(batchSize) > 0 && batchSize[0] > 0 {
 		size = batchSize[0]
 	}
-	return db.dbMgr.batchDeleteByIds(sdb, table, ids, size)
+	return db.dbMgr.batchDeleteByIds(executor, table, ids, size)
 }
 
 func (db *DB) Count(table string, whereSql string, whereArgs ...interface{}) (int64, error) {
 	if db.lastErr != nil {
 		return 0, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return 0, err
 	}
@@ -900,13 +960,13 @@ func (db *DB) Count(table string, whereSql string, whereArgs ...interface{}) (in
 				return count, nil
 			}
 		}
-		count, err := db.dbMgr.count(sdb, table, whereSql, whereArgs...)
+		count, err := db.dbMgr.count(executor, table, whereSql, whereArgs...)
 		if err == nil {
 			cache.CacheSet(db.cacheRepositoryName, key, count, getEffectiveTTL(db.cacheRepositoryName, db.cacheTTL))
 		}
 		return count, err
 	}
-	return db.dbMgr.count(sdb, table, whereSql, whereArgs...)
+	return db.dbMgr.count(executor, table, whereSql, whereArgs...)
 }
 
 func (db *DB) Ping() error {
@@ -920,11 +980,11 @@ func (db *DB) Exists(table string, whereSql string, whereArgs ...interface{}) (b
 	if db.lastErr != nil {
 		return false, db.lastErr
 	}
-	sdb, err := db.dbMgr.getDB()
+	executor, err := db.getExecutor()
 	if err != nil {
 		return false, err
 	}
-	return db.dbMgr.exists(sdb, table, whereSql, whereArgs...)
+	return db.dbMgr.exists(executor, table, whereSql, whereArgs...)
 }
 
 func (db *DB) PaginateBuilder(page int, pageSize int, selectSql string, table string, whereSql string, orderBySql string, args ...interface{}) (*Page[*Record], error) {
@@ -1135,10 +1195,7 @@ func (db *DB) Transaction(fn func(*Tx) error) (err error) {
 		if p := recover(); p != nil {
 			// 发生 Panic 时强制回滚
 			if rbErr := tx.Rollback(); rbErr != nil {
-				LogError("transaction rollback failed on panic", map[string]interface{}{
-					"rollback_error": rbErr.Error(),
-					"panic":          p,
-				})
+				LogError("transaction rollback failed on panic", NewRecord().Set("rollback_error", rbErr.Error()).Set("panic", p))
 			}
 			// 重新抛出 Panic 以保留堆栈信息，防止静默失败
 			panic(p)
@@ -1147,10 +1204,7 @@ func (db *DB) Transaction(fn func(*Tx) error) (err error) {
 
 	if err = fn(dbtx); err != nil {
 		if rbErr := tx.Rollback(); rbErr != nil {
-			LogError("transaction rollback failed", map[string]interface{}{
-				"original_error": err.Error(),
-				"rollback_error": rbErr.Error(),
-			})
+			LogError("transaction rollback failed", NewRecord().Set("original_error", err.Error()).Set("rollback_error", rbErr.Error()))
 		}
 		return err
 	}
@@ -1189,9 +1243,7 @@ func (tx *Tx) RedisCache(cacheRepositoryName string, ttl ...time.Duration) *Tx {
 	redisCache := GetRedisCacheInstance()
 	if redisCache == nil {
 		// 如果 Redis 缓存未初始化，记录错误但不中断链式调用
-		LogError("Redis cache not initialized for transaction", map[string]interface{}{
-			"cacheRepositoryName": cacheRepositoryName,
-		})
+		LogError("Redis cache not initialized for transaction", NewRecord().Set("cacheRepositoryName", cacheRepositoryName))
 		return tx
 	}
 

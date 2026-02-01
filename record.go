@@ -195,6 +195,17 @@ func (r *Record) Set(column string, value interface{}) *Record {
 		}
 	}
 
+	// 惰性初始化，防止反射创建的对象 map 为 nil
+	if r.columns == nil {
+		r.columns = make(map[string]interface{}, 8)
+	}
+	if r.lowerKeyMap == nil {
+		r.lowerKeyMap = make(map[string]string, 8)
+	}
+	if r.keys == nil {
+		r.keys = make([]string, 0, 8)
+	}
+
 	// 维护小写映射用于快速查找
 	lowerKey := strings.ToLower(column)
 

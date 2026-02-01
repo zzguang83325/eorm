@@ -194,10 +194,9 @@ func (mgr *SqlConfigManager) LoadConfig(configPath string) (*SqlConfig, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		// Log file read error
-		LogError("Failed to read SQL config file", map[string]interface{}{
-			"configPath": configPath,
-			"error":      err.Error(),
-		})
+		LogError("Failed to read SQL config file", NewRecord().
+			Set("configPath", configPath).
+			Set("error", err.Error()))
 		return nil, &SqlConfigError{
 			Type:    "FileReadError",
 			Message: fmt.Sprintf("failed to read config file: %s", err.Error()),
@@ -208,10 +207,9 @@ func (mgr *SqlConfigManager) LoadConfig(configPath string) (*SqlConfig, error) {
 	var config SqlConfig
 	if err := json.Unmarshal(data, &config); err != nil {
 		// Log parse error
-		LogError("Failed to parse SQL config JSON", map[string]interface{}{
-			"configPath": configPath,
-			"error":      err.Error(),
-		})
+		LogError("Failed to parse SQL config JSON", NewRecord().
+			Set("configPath", configPath).
+			Set("error", err.Error()))
 		return nil, &SqlConfigError{
 			Type:    "ParseError",
 			Message: fmt.Sprintf("failed to parse JSON config: %s", err.Error()),
@@ -225,11 +223,10 @@ func (mgr *SqlConfigManager) LoadConfig(configPath string) (*SqlConfig, error) {
 	// Validate and process SQL items
 	if err := mgr.processSqlItems(&config); err != nil {
 		// Log processing error
-		LogError("Failed to process SQL items", map[string]interface{}{
-			"configPath": configPath,
-			"namespace":  config.Namespace,
-			"error":      err.Error(),
-		})
+		LogError("Failed to process SQL items", NewRecord().
+			Set("configPath", configPath).
+			Set("namespace", config.Namespace).
+			Set("error", err.Error()))
 		return nil, err
 	}
 
@@ -238,12 +235,11 @@ func (mgr *SqlConfigManager) LoadConfig(configPath string) (*SqlConfig, error) {
 	mgr.configPaths = append(mgr.configPaths, configPath)
 
 	// Log successful config loading
-	LogInfo("SQL config loaded successfully", map[string]interface{}{
-		"configPath": configPath,
-		"namespace":  config.Namespace,
-		"version":    config.Version,
-		"sqlCount":   len(config.Sqls),
-	})
+	LogInfo("SQL config loaded successfully", NewRecord().
+		Set("configPath", configPath).
+		Set("namespace", config.Namespace).
+		Set("version", config.Version).
+		Set("sqlCount", len(config.Sqls)))
 
 	return &config, nil
 }
@@ -575,10 +571,9 @@ func (b *SqlTemplateBuilder) RedisCache(cacheRepositoryName string, ttl ...time.
 	redisCache := GetRedisCacheInstance()
 	if redisCache == nil {
 		// 如果 Redis 缓存未初始化，记录错误但不中断链式调用
-		LogError("Redis cache not initialized for SQL template", map[string]interface{}{
-			"sqlName":             b.sqlName,
-			"cacheRepositoryName": cacheRepositoryName,
-		})
+		LogError("Redis cache not initialized for SQL template", NewRecord().
+			Set("sqlName", b.sqlName).
+			Set("cacheRepositoryName", cacheRepositoryName))
 		return b
 	}
 
@@ -972,10 +967,9 @@ func (engine *SqlTemplateEngine) ProcessTemplate(sqlItem *SqlItem, params interf
 	// First, validate parameter type against SQL format
 	if err := engine.validateParameterTypeMatch(sqlItem.SQL, params); err != nil {
 		// Log parameter validation error
-		LogError("SQL template parameter validation failed", map[string]interface{}{
-			"sqlName": sqlItem.Name,
-			"error":   err.Error(),
-		})
+		LogError("SQL template parameter validation failed", NewRecord().
+			Set("sqlName", sqlItem.Name).
+			Set("error", err.Error()))
 		return "", nil, err
 	}
 
@@ -983,10 +977,9 @@ func (engine *SqlTemplateEngine) ProcessTemplate(sqlItem *SqlItem, params interf
 	paramMap, err := engine.normalizeParameters(params)
 	if err != nil {
 		// Log parameter normalization error
-		LogError("SQL template parameter normalization failed", map[string]interface{}{
-			"sqlName": sqlItem.Name,
-			"error":   err.Error(),
-		})
+		LogError("SQL template parameter normalization failed", NewRecord().
+			Set("sqlName", sqlItem.Name).
+			Set("error", err.Error()))
 		return "", nil, err
 	}
 
@@ -1027,23 +1020,21 @@ func (engine *SqlTemplateEngine) ProcessTemplate(sqlItem *SqlItem, params interf
 	processedSQL, args, err := engine.processNamedParameters(finalSQL, paramMap)
 	if err != nil {
 		// Log parameter processing error
-		LogError("SQL template parameter processing failed", map[string]interface{}{
-			"sqlName":  sqlItem.Name,
-			"finalSQL": finalSQL,
-			"error":    err.Error(),
-		})
+		LogError("SQL template parameter processing failed", NewRecord().
+			Set("sqlName", sqlItem.Name).
+			Set("finalSQL", finalSQL).
+			Set("error", err.Error()))
 		return "", nil, err
 	}
 
 	// Log successful SQL template processing in debug mode
-	// LogDebug("SQL template processed successfully", map[string]interface{}{
-	// 	"sqlName":      sqlItem.Name,
-	// 	"originalSQL":  sqlItem.SQL,
-	// 	"processedSQL": processedSQL,
-	// 	"paramCount":   len(args),
-	// 	"hasInParam":   len(sqlItem.InParam) > 0,
-	// 	"hasOrderBy":   sqlItem.Order != "",
-	// })
+	// LogDebug("SQL template processed successfully", NewRecord().
+	// 	Set("sqlName", sqlItem.Name).
+	// 	Set("originalSQL", sqlItem.SQL).
+	// 	Set("processedSQL", processedSQL).
+	// 	Set("paramCount", len(args)).
+	// 	Set("hasInParam", len(sqlItem.InParam) > 0).
+	// 	Set("hasOrderBy", sqlItem.Order != ""))
 
 	return processedSQL, args, nil
 }

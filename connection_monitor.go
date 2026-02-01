@@ -121,19 +121,17 @@ func (cm *ConnectionMonitor) checkConnection() bool {
 
 // LogConnectionError 记录连接错误日志（仅在检测到连接失败时记录）
 func LogConnectionError(dbName string, err error) {
-	LogError("数据库连接失败", map[string]interface{}{
-		"database": dbName,
-		"error":    err.Error(),
-		"time":     time.Now(),
-	})
+	LogError("数据库连接失败", NewRecord().
+		Set("database", dbName).
+		Set("error", err.Error()).
+		Set("time", time.Now()))
 }
 
 // LogConnectionRecovered 记录连接恢复日志（仅在连接从失败状态恢复时记录）
 func LogConnectionRecovered(dbName string) {
-	LogInfo("数据库连接已恢复", map[string]interface{}{
-		"database": dbName,
-		"time":     time.Now(),
-	})
+	LogInfo("数据库连接已恢复", NewRecord().
+		Set("database", dbName).
+		Set("time", time.Now()))
 }
 
 // run 监控器主循环

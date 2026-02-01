@@ -129,19 +129,17 @@ func (db *DB) ConfigTimestampsWithFields(table, createdAtField, updatedAtField s
 
 	// 检查字段是否存在
 	if createdAtField != "" && !db.dbMgr.checkTableColumn(table, createdAtField) {
-		LogWarn(fmt.Sprintf("时间戳配置警告: 表 '%s' 中不存在字段 '%s'", table, createdAtField), map[string]interface{}{
-			"db":    db.dbMgr.name,
-			"table": table,
-			"field": createdAtField,
-		})
+		LogWarn(fmt.Sprintf("时间戳配置警告: 表 '%s' 中不存在字段 '%s'", table, createdAtField), NewRecord().
+			Set("db", db.dbMgr.name).
+			Set("table", table).
+			Set("field", createdAtField))
 	}
 
 	if updatedAtField != "" && !db.dbMgr.checkTableColumn(table, updatedAtField) {
-		LogWarn(fmt.Sprintf("时间戳配置警告: 表 '%s' 中不存在字段 '%s'", table, updatedAtField), map[string]interface{}{
-			"db":    db.dbMgr.name,
-			"table": table,
-			"field": updatedAtField,
-		})
+		LogWarn(fmt.Sprintf("时间戳配置警告: 表 '%s' 中不存在字段 '%s'", table, updatedAtField), NewRecord().
+			Set("db", db.dbMgr.name).
+			Set("table", table).
+			Set("field", updatedAtField))
 	}
 
 	db.dbMgr.setTimestampConfig(table, &TimestampConfig{

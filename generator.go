@@ -15,12 +15,13 @@ type IDbModel interface {
 
 // ColumnInfo represents column metadata
 type ColumnInfo struct {
-	Name       string // 列名
-	Type       string // 数据类型
-	Nullable   bool   // 是否可空
-	IsPK       bool   // 是否主键
-	Comment    string // 列注释
-	IsAutoIncr bool   // 是否自增长
+	Name             string // 列名
+	Type             string // 数据类型
+	Nullable         bool   // 是否可空
+	IsPK             bool   // 是否主键
+	Comment          string // 列注释
+	IsAutoIncr       bool   // 是否自增长
+	IsIdentityAlways bool   // PostgreSQL: 是否为 GENERATED ALWAYS AS IDENTITY (新增)
 }
 
 // GenerateDbModel generates a Go struct for the specified table and saves it to a file
@@ -342,14 +343,18 @@ func (mgr *dbManager) getTableColumns(table string) ([]ColumnInfo, error) {
 		for _, r := range records {
 			columnKey := r.GetString("column_key")
 			extra := r.GetString("extra")
+			isAutoIncr := strings.Contains(strings.ToLower(extra), "identity") ||
+				strings.Contains(strings.ToLower(extra), "serial") ||
+				strings.Contains(strings.ToLower(extra), "nextval")
 
 			columns = append(columns, ColumnInfo{
-				Name:       r.GetString("column_name"),
-				Type:       r.GetString("data_type"),
-				Nullable:   r.GetString("is_nullable") == "YES",
-				IsPK:       columnKey == "PRI",
-				Comment:    r.GetString("column_comment"),
-				IsAutoIncr: strings.Contains(strings.ToLower(extra), "auto_increment") || strings.Contains(strings.ToLower(extra), "nextval"),
+				Name:             r.GetString("column_name"),
+				Type:             r.GetString("data_type"),
+				Nullable:         r.GetString("is_nullable") == "YES",
+				IsPK:             columnKey == "PRI",
+				Comment:          r.GetString("column_comment"),
+				IsAutoIncr:       isAutoIncr,
+				IsIdentityAlways: strings.Contains(strings.ToLower(extra), "always"),
 			})
 		}
 		// // SQLite: 检查是否有 INTEGER PRIMARY KEY (自动自增)
@@ -402,14 +407,18 @@ func (mgr *dbManager) getTableColumns(table string) ([]ColumnInfo, error) {
 		for _, r := range records {
 			columnKey := r.GetString("column_key")
 			extra := r.GetString("extra")
+			isAutoIncr := strings.Contains(strings.ToLower(extra), "identity") ||
+				strings.Contains(strings.ToLower(extra), "serial") ||
+				strings.Contains(strings.ToLower(extra), "nextval")
 
 			columns = append(columns, ColumnInfo{
-				Name:       r.GetString("column_name"),
-				Type:       r.GetString("data_type"),
-				Nullable:   r.GetString("is_nullable") == "YES",
-				IsPK:       columnKey == "PRI",
-				Comment:    r.GetString("column_comment"),
-				IsAutoIncr: strings.Contains(strings.ToLower(extra), "auto_increment") || strings.Contains(strings.ToLower(extra), "nextval"),
+				Name:             r.GetString("column_name"),
+				Type:             r.GetString("data_type"),
+				Nullable:         r.GetString("is_nullable") == "YES",
+				IsPK:             columnKey == "PRI",
+				Comment:          r.GetString("column_comment"),
+				IsAutoIncr:       isAutoIncr,
+				IsIdentityAlways: strings.Contains(strings.ToLower(extra), "always"),
 			})
 		}
 

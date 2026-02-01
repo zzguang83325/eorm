@@ -50,7 +50,7 @@ func (l LogLevel) String() string {
 // Logger interface defines simple behavior for logging with structured fields
 type Logger interface {
 	// Log records a log entry. fields is optional (can be nil).
-	Log(level LogLevel, msg string, fields map[string]interface{})
+	Log(level LogLevel, msg string, fields *Record)
 }
 
 // slogLogger is an adapter for log/slog
@@ -58,16 +58,19 @@ type slogLogger struct {
 	logger *slog.Logger
 }
 
-func (s *slogLogger) Log(level LogLevel, msg string, fields map[string]interface{}) {
+func (s *slogLogger) Log(level LogLevel, msg string, fields *Record) {
 	l := s.logger
 	if l == nil {
 		l = slog.Default()
 	}
 
-	// Convert map to slice of key-value pairs for slog with stable order
+	// Convert Record to slice of key-value pairs for slog with stable order
 	var args []interface{}
-	if len(fields) > 0 {
-		args = make([]interface{}, 0, len(fields)*2)
+	if fields != nil {
+		fields.mu.RLock()
+		defer fields.mu.RUnlock()
+
+		args = make([]interface{}, 0, len(fields.columns)*2)
 
 		// Priority keys to print first in specific order
 		priorityKeys := []string{"db", "duration", "sql", "args", "error"}
@@ -75,7 +78,7 @@ func (s *slogLogger) Log(level LogLevel, msg string, fields map[string]interface
 
 		// 1. Process priority keys first
 		for _, k := range priorityKeys {
-			if v, ok := fields[k]; ok {
+			if v, ok := fields.columns[k]; ok {
 				if k == "args" {
 					if slice, ok := v.([]interface{}); ok {
 						v = formatValue(slice)
@@ -87,8 +90,8 @@ func (s *slogLogger) Log(level LogLevel, msg string, fields map[string]interface
 		}
 
 		// 2. Sort remaining keys
-		remainingKeys := make([]string, 0, len(fields)-len(processedKeys))
-		for k := range fields {
+		remainingKeys := make([]string, 0, len(fields.columns)-len(processedKeys))
+		for k := range fields.columns {
 			if !processedKeys[k] {
 				remainingKeys = append(remainingKeys, k)
 			}
@@ -97,7 +100,7 @@ func (s *slogLogger) Log(level LogLevel, msg string, fields map[string]interface
 
 		// 3. Process remaining keys
 		for _, k := range remainingKeys {
-			v := fields[k]
+			v := fields.columns[k]
 			args = append(args, k, v)
 		}
 	}
@@ -196,11 +199,7 @@ func (d *internalEncodingDetector) fixTextEncoding(text string) string {
 				if d.isValidResult(result, data, encodingName) {
 					// 在调试模式下记录转换
 					if debug {
-						LogDebug("编码转换成功", map[string]interface{}{
-							"原始文本": text,
-							"检测编码": encodingName,
-							"转换结果": result,
-						})
+						LogDebug("编码转换成功", NewRecord().Set("原始文本", text).Set("检测编码", encodingName).Set("转换结果", result))
 					}
 					return result
 				}
@@ -369,13 +368,14 @@ func cleanSQL(sql string) string {
 // LogSQL logs SQL statement, parameters and execution time in debug mode
 func LogSQL(dbName string, sql string, args []interface{}, duration time.Duration) {
 	if debug {
-		fields := map[string]interface{}{
-			"db":       dbName,
-			"sql":      cleanSQL(sql),
-			"duration": duration.String(),
-		}
+		fields := NewRecord().
+			Set("db", dbName).
+			Set("sql", cleanSQL(sql)).
+			Set("duration", duration.String()).
+			Set("caller", GetCaller())
+
 		if len(args) > 0 {
-			fields["args"] = args
+			fields.Set("args", args)
 		}
 		currentLogger.Log(LevelDebug, "SQL log", fields)
 	}
@@ -386,20 +386,20 @@ func LogSQLError(dbName string, sql string, args []interface{}, duration time.Du
 	// 自动修复错误信息的编码问题
 	errorMsg := fixStringEncoding(err.Error())
 
-	fields := map[string]interface{}{
-		"db":       dbName,
-		"sql":      cleanSQL(sql),
-		"duration": duration.String(),
-		"error":    errorMsg,
-		"caller":   getCaller(), // 添加调用位置
-	}
+	fields := NewRecord().
+		Set("db", dbName).
+		Set("sql", cleanSQL(sql)).
+		Set("duration", duration.String()).
+		Set("error", errorMsg).
+		Set("caller", GetFullCaller()) // 添加调用位置
+
 	if len(args) > 0 {
-		fields["args"] = args
+		fields.Set("args", args)
 	}
 	currentLogger.Log(LevelError, "SQL failed log", fields)
 }
 
-func getCaller() string {
+func GetFullCaller() string {
 	callers := make([]uintptr, 10)
 	count := runtime.Callers(2, callers) // 从第2层开始获取
 	var callerStack []string
@@ -443,41 +443,46 @@ func getCaller() string {
 	return callerInfo
 }
 
-// LogInfo logs info message
-func LogInfo(msg string, fields ...map[string]interface{}) {
-	var f map[string]interface{}
-	if len(fields) > 0 {
-		f = fields[0]
+func GetCaller() string {
+	_, file, line, ok := runtime.Caller(2)
+	if !ok {
+		return ""
 	}
-	currentLogger.Log(LevelInfo, msg, f)
+	return fmt.Sprintf("%s:%d", file, line)
+}
+
+// LogInfo logs info message
+func LogInfo(msg string, fields *Record) {
+	if !fields.Has("caller") {
+		fields.Set("caller", GetCaller())
+	}
+	currentLogger.Log(LevelInfo, msg, fields)
 }
 
 // LogWarn logs warning message
-func LogWarn(msg string, fields ...map[string]interface{}) {
-	var f map[string]interface{}
-	if len(fields) > 0 {
-		f = fields[0]
+func LogWarn(msg string, fields *Record) {
+	if !fields.Has("caller") {
+		fields.Set("caller", GetCaller())
 	}
-	currentLogger.Log(LevelWarn, msg, f)
+	currentLogger.Log(LevelWarn, msg, fields)
 }
 
 // LogError logs error message
-func LogError(msg string, fields ...map[string]interface{}) {
-	var f map[string]interface{}
-	if len(fields) > 0 {
-		f = fields[0]
+func LogError(msg string, fields *Record) {
+
+	if !fields.Has("caller") {
+		fields.Set("caller", GetFullCaller())
 	}
-	currentLogger.Log(LevelError, msg, f)
+	currentLogger.Log(LevelError, msg, fields)
 }
 
 // LogDebug logs debug message
-func LogDebug(msg string, fields ...map[string]interface{}) {
+func LogDebug(msg string, fields *Record) {
 	if debug {
-		var f map[string]interface{}
-		if len(fields) > 0 {
-			f = fields[0]
+		if !fields.Has("caller") {
+			fields.Set("caller", GetCaller())
 		}
-		currentLogger.Log(LevelDebug, msg, f)
+		currentLogger.Log(LevelDebug, msg, fields)
 	}
 }
 

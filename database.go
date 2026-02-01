@@ -82,6 +82,13 @@ func IsValidDriver(driver DriverType) bool {
 	return false
 }
 
+// SqlExecutor is an interface for executing SQL commands (exported for plugin support)
+type SqlExecutor interface {
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
+
 // DB represents a database connection with chainable methods
 type DB struct {
 	dbMgr               *dbManager
@@ -91,6 +98,22 @@ type DB struct {
 	timeout             time.Duration // Query timeout for this instance
 	cacheProvider       CacheProvider // 指定的缓存提供者（nil 表示使用默认缓存）
 	countCacheTTL       time.Duration // 分页计数缓存时间（-1 表示不使用，0 表示不缓存，>0 表示使用指定时间）
+	executor            SqlExecutor   // 指定的执行器（用于事务支持）
+}
+
+// WithExecutor 指定执行器（用于支持外部事务，如 GORM 事务）
+func (db *DB) WithExecutor(executor SqlExecutor) *DB {
+	newDB := *db
+	newDB.executor = executor
+	return &newDB
+}
+
+// getExecutor 获取当前执行器，如果没有指定则返回底层数据库连接
+func (db *DB) getExecutor() (SqlExecutor, error) {
+	if db.executor != nil {
+		return db.executor, nil
+	}
+	return db.dbMgr.getDB()
 }
 
 // GetConfig returns the database configuration
@@ -950,6 +973,23 @@ func (mgr *dbManager) isInt64PrimaryKey(table string, pk string) bool {
 	return false
 }
 
+// hasIdentityAlways 检查表中是否包含 GENERATED ALWAYS AS IDENTITY 列，且该列在插入列表中
+func (mgr *dbManager) hasIdentityAlways(table string, insertCols []string) bool {
+	tableCols, err := mgr.getTableColumns(table)
+	if err != nil {
+		return false
+	}
+
+	for _, colName := range insertCols {
+		for _, tc := range tableCols {
+			if strings.EqualFold(colName, tc.Name) && tc.IsIdentityAlways {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (mgr *dbManager) saveRecord(executor sqlExecutor, table string, record *Record) (int64, error) {
 	if err := validateIdentifier(table); err != nil {
 		return 0, err
@@ -1190,7 +1230,12 @@ func (mgr *dbManager) nativeUpsert(executor sqlExecutor, table string, record *R
 	identityCol := mgr.getIdentityColumn(executor, table)
 	_ = identityCol // 目前在 nativeUpsert 中仅作为保留，用于后续可能的扩展
 
-	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, joinStrings(columns), joinStrings(placeholders))
+	var sqlStr string
+	if driver == PostgreSQL && mgr.hasIdentityAlways(table, columns) {
+		sqlStr = fmt.Sprintf("INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE VALUES (%s)", table, joinStrings(columns), joinStrings(placeholders))
+	} else {
+		sqlStr = fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, joinStrings(columns), joinStrings(placeholders))
+	}
 
 	var updateClauses []string
 	for _, col := range columns {
@@ -2243,40 +2288,36 @@ func (mgr *dbManager) batchUpdateWithOptimisticLockInTransaction(executor sqlExe
 	if err != nil {
 		// 更新失败，回滚事务
 		if rollbackErr := tx.Rollback(); rollbackErr != nil {
-			LogError("批量更新事务回滚失败", map[string]interface{}{
-				"db":            mgr.name,
-				"table":         table,
-				"updateError":   err.Error(),
-				"rollbackError": rollbackErr.Error(),
-			})
+			LogError("批量更新事务回滚失败", NewRecord().
+				Set("db", mgr.name).
+				Set("table", table).
+				Set("updateError", err.Error()).
+				Set("rollbackError", rollbackErr.Error()))
 			return 0, fmt.Errorf("update failed: %v, rollback failed: %v", err, rollbackErr)
 		}
 
-		LogInfo("批量更新失败，事务已回滚", map[string]interface{}{
-			"db":      mgr.name,
-			"table":   table,
-			"records": len(records),
-			"error":   err.Error(),
-		})
+		LogInfo("批量更新失败，事务已回滚", NewRecord().
+			Set("db", mgr.name).
+			Set("table", table).
+			Set("records", len(records)).
+			Set("error", err.Error()))
 		return 0, err
 	}
 
 	// 更新成功，提交事务
 	if err := tx.Commit(); err != nil {
-		LogError("批量更新事务提交失败", map[string]interface{}{
-			"db":    mgr.name,
-			"table": table,
-			"error": err.Error(),
-		})
+		LogError("批量更新事务提交失败", NewRecord().
+			Set("db", mgr.name).
+			Set("table", table).
+			Set("error", err.Error()))
 		return 0, fmt.Errorf("failed to commit transaction: %v", err)
 	}
 
-	LogInfo("批量更新事务提交成功", map[string]interface{}{
-		"db":            mgr.name,
-		"table":         table,
-		"records":       len(records),
-		"totalAffected": totalAffected,
-	})
+	LogInfo("批量更新事务提交成功", NewRecord().
+		Set("db", mgr.name).
+		Set("table", table).
+		Set("records", len(records)).
+		Set("totalAffected", totalAffected))
 
 	return totalAffected, nil
 }
@@ -2351,13 +2392,12 @@ func (mgr *dbManager) batchUpdateWithOptimisticLock(executor sqlExecutor, table 
 				for _, pk := range pks {
 					pkInfo[pk] = record.Get(pk)
 				}
-				LogWarn("乐观锁版本冲突", map[string]interface{}{
-					"db":              mgr.name,
-					"table":           table,
-					"primaryKeys":     pkInfo,
-					"expectedVersion": currentVersion,
-					"versionField":    optimisticConfig.VersionField,
-				})
+				LogWarn("乐观锁版本冲突", NewRecord().
+					Set("db", mgr.name).
+					Set("table", table).
+					Set("primaryKeys", pkInfo).
+					Set("expectedVersion", currentVersion).
+					Set("versionField", optimisticConfig.VersionField))
 				return totalAffected, ErrVersionMismatch
 			}
 			totalAffected += affected
@@ -3505,10 +3545,9 @@ func (mgr *dbManager) initDB() error {
 	if mgr.config.MonitorNormalInterval > 0 {
 		if err := mgr.startConnectionMonitoring(); err != nil {
 			// 监控启动失败不影响数据库连接，只记录警告日志
-			LogWarn("连接监控启动失败", map[string]interface{}{
-				"database": mgr.name,
-				"error":    err.Error(),
-			})
+			LogWarn("连接监控启动失败", NewRecord().
+				Set("database", mgr.name).
+				Set("error", err.Error()))
 		}
 	}
 
@@ -3817,12 +3856,13 @@ ORDER BY
     -- 详细的自增信息
     WHEN i.indisprimary THEN
       CASE
-        WHEN a.attidentity = 'a' THEN 'auto_increment'  -- ALWAYS AS IDENTITY
-        WHEN a.attidentity = 'd' THEN 'auto_increment'  -- BY DEFAULT AS IDENTITY
-        WHEN pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval%' THEN 'auto_increment'  -- SERIAL
+        WHEN a.attidentity = 'a' THEN 'identity_always'  -- ALWAYS AS IDENTITY
+        WHEN a.attidentity = 'd' THEN 'identity_by_default'  -- BY DEFAULT AS IDENTITY
+        WHEN pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval%' THEN 'serial'  -- SERIAL
         ELSE ''
       END
-    WHEN a.attidentity IN ('a', 'd') THEN 'identity'  -- 非主键的IDENTITY列
+    WHEN a.attidentity = 'a' THEN 'identity_always'  -- 非主键的IDENTITY列
+    WHEN a.attidentity = 'd' THEN 'identity_by_default'
     WHEN pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval%' THEN 'sequence'  -- 非主键的SERIAL
     ELSE ''
   END AS extra,
@@ -4312,10 +4352,9 @@ func (mgr *dbManager) warmUpColumnCache() {
 		if err.Error() == "sql: database is closed" {
 			return
 		}
-		LogWarn("预热表结构缓存失败: 获取表名失败", map[string]interface{}{
-			"database": mgr.name,
-			"error":    err.Error(),
-		})
+		LogWarn("预热表结构缓存失败: 获取表名失败", NewRecord().
+			Set("database", mgr.name).
+			Set("error", err.Error()))
 		return
 	}
 
@@ -4332,11 +4371,10 @@ func (mgr *dbManager) warmUpColumnCache() {
 			if err.Error() == "sql: database is closed" {
 				return
 			}
-			LogWarn("预热表结构缓存失败", map[string]interface{}{
-				"database": mgr.name,
-				"table":    table,
-				"error":    err.Error(),
-			})
+			LogWarn("预热表结构缓存失败", NewRecord().
+				Set("database", mgr.name).
+				Set("table", table).
+				Set("error", err.Error()))
 		}
 
 		// if debug {

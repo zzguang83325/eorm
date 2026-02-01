@@ -506,10 +506,9 @@ func (qb *QueryBuilder) RedisCache(cacheRepositoryName string, ttl ...time.Durat
 	redisCache := GetRedisCacheInstance()
 	if redisCache == nil {
 		// 如果 Redis 缓存未初始化，记录错误但不中断链式调用
-		LogError("Redis cache not initialized for QueryBuilder", map[string]interface{}{
-			"table":               qb.table,
-			"cacheRepositoryName": cacheRepositoryName,
-		})
+		LogError("Redis cache not initialized for QueryBuilder", NewRecord().
+			Set("table", qb.table).
+			Set("cacheRepositoryName", cacheRepositoryName))
 		return qb
 	}
 
