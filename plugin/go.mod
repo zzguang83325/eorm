@@ -2,8 +2,6 @@ module github.com/zzguang83325/eorm/plugin
 
 go 1.24.0
 
-
-
 require (
 	github.com/zzguang83325/eorm v1.0.3
 	gorm.io/gorm v1.31.1
